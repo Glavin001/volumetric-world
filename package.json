@@ -1,0 +1,26 @@
+{
+  "name": "volumetric-world",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-scale world-space participating-media engine for three.js/WebGPU: pooled MAC-grid simulation islands, moving solid boundaries, persistent anisotropic volume packets, and a physically based volumetric renderer.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "test:server": "vite build && vite preview --port 4173 --strictPort",
+    "test": "playwright test",
+    "screenshots": "node scripts/capture.mjs"
+  },
+  "dependencies": {
+    "lil-gui": "^0.20.0",
+    "three": "0.180.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/node": "^22.10.0",
+    "@types/three": "0.180.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}

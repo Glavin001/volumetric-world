@@ -1,0 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Manrope:wght@400;500;600&display=swap');
+
+:root { color: #e8e2d8; background: #080a0a; font-family: Manrope, sans-serif; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; background: #080a0a; }
+canvas { display: block; }
+.ui { position: fixed; inset: 0; pointer-events: none; }
+.brand { position: absolute; top: 28px; left: 34px; font: 500 13px/1 DM Mono, monospace; letter-spacing: .15em; }
+.brand b { color: #e3874f; font-weight: 500; }
+.brand small { display: block; color: #777b78; font-size: 8px; margin-top: 9px; letter-spacing: .24em; }
+.status { position: absolute; top: 28px; right: 34px; display: flex; align-items: center; gap: 10px; color: #8d918e; font: 400 9px DM Mono, monospace; letter-spacing: .12em; }
+.status i { display: block; width: 6px; height: 6px; border-radius: 50%; background: #9cc37d; box-shadow: 0 0 12px #9cc37d; }
+.title { position: absolute; left: 34px; bottom: 45px; }
+.eyebrow { display: flex; align-items: center; gap: 12px; color: #e3874f; font: 500 9px DM Mono, monospace; letter-spacing: .2em; }
+.eyebrow:before { content: ''; width: 26px; height: 1px; background: #e3874f; }
+h1 { margin: 15px 0 11px; max-width: 520px; font-size: clamp(38px, 5vw, 68px); font-weight: 400; line-height: .94; letter-spacing: -.055em; }
+.subtitle { color: #999b97; font-size: 11px; max-width: 380px; line-height: 1.6; }
+.controls { pointer-events: auto; position: absolute; right: 34px; bottom: 38px; width: 270px; padding: 16px; border: 1px solid #ffffff17; background: #111514cc; backdrop-filter: blur(12px); }
+.row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; color: #858a86; font: 400 9px DM Mono, monospace; letter-spacing: .1em; }
+.metric { color: #d2d0ca; }
+.bar { height: 2px; background: #2b302e; margin: 6px 0 14px; }
+.bar span { display: block; width: 41%; height: 100%; background: #e3874f; box-shadow: 0 0 8px #e3874f88; }
+button { width: 100%; border: 1px solid #e3874f80; color: #e9d5c8; background: #b85f2b18; padding: 11px; font: 500 9px DM Mono, monospace; letter-spacing: .15em; cursor: pointer; transition: .2s; }
+button:hover { background: #b85f2b38; border-color: #e3874f; }
+.hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); color: #616663; font: 8px DM Mono, monospace; letter-spacing: .14em; }
+@media (max-width: 700px) { .controls { display: none; } .title { bottom: 36px; } .hint { display: none; } }

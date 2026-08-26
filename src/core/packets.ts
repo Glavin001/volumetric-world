@@ -166,6 +166,15 @@ export class PacketSystem {
       p.radii[1] += grow * 0.6;
       p.radii[2] += grow;
 
+      // Aspect guard: splits and ground pancaking can leave a packet metres
+      // long but only ~0.25 m thin, which renders as a bright "glass shard".
+      // Thicken the thin axes (mass is conserved; peak density drops).
+      const maxR = Math.max(p.radii[0], p.radii[1], p.radii[2]);
+      const minAllowed = maxR / 5;
+      p.radii[0] = Math.max(p.radii[0], minAllowed);
+      p.radii[1] = Math.max(p.radii[1], minAllowed);
+      p.radii[2] = Math.max(p.radii[2], minAllowed);
+
       // Ground contact: clamp and pancake (gravity-current flavored spreading).
       const floor = this.groundY + p.radii[1] * 0.55;
       if (p.position[1] < floor) {

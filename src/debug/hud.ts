@@ -23,6 +23,7 @@ export class Hud {
     detail: 0.75,
     exposure: 0.55,
     dustShadow: 0.85,
+    translucency: 0.35,
     debugDistance: false,
     paused: false,
   };
@@ -78,6 +79,7 @@ export class Hud {
     look.add(c, 'detail', 0, 1.2, 0.05).onChange((v: number) => ((world.pass.detailStrength as { value: number }).value = v));
     look.add(c, 'exposure', 0.1, 1.6, 0.05).onChange((v: number) => ((world.pass.exposure as { value: number }).value = v));
     look.add(c, 'dustShadow', 0, 1, 0.05).onChange((v: number) => ((world.pass.dustShadowStrength as { value: number }).value = v));
+    look.add(c, 'translucency', 0.05, 1.0, 0.05).name('shadow density').onChange((v: number) => world.setTranslucency(v));
     look.add(c, 'debugDistance').onChange((v: boolean) => ((world.pass.debugMode as { value: number }).value = v ? 1 : 0));
     this.gui.add(c, 'paused');
     if (onDownloadReport) {

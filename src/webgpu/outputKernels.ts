@@ -85,7 +85,8 @@ export function initAtlasTextures(renderer: THREE.WebGPURenderer, atlas: VolumeA
   upload(atlas.texShadow, 4, (b) => b.fill(0xff));
 }
 
-const MAX_SIGMA_T = 250.0;
+/** Extinction soft-knee (1/m): sigma compresses toward this instead of clamping. */
+const SIGMA_KNEE = 70.0;
 
 /** Bake density moments + center velocity into the render atlas (with soft slot-edge fade). */
 export function kWriteVolume(f: IslandFields, s: ScratchFields, uni: IslandUniforms, atlas: VolumeAtlas): any {
@@ -97,15 +98,22 @@ export function kWriteVolume(f: IslandFields, s: ScratchFields, uni: IslandUnifo
       const a = f.dA.node.element(instanceIndex).toVar();
       const b = f.dB.node.element(instanceIndex).toVar();
 
-      // Soft 2-voxel fade at slot edges: keeps trilinear sampling from bleeding
-      // across atlas slots and gives islands soft open boundaries.
+      // World-space (~1.2 m) fade at slot edges: keeps trilinear sampling from
+      // bleeding across atlas slots and gives islands soft open boundaries. A
+      // fixed 2-voxel fade was ~0.2 m at fine tiers, which made a freshly
+      // filled island read as a hard white box.
       const ex = min(float(x), float(N - 1).sub(float(x)));
       const ey = min(float(y), float(N - 1).sub(float(y)));
       const ez = min(float(z), float(N - 1).sub(float(z)));
       const edge = min(ex, min(ey, ez)).add(0.5);
-      const fade = smoothstep(0.0, 2.0, edge);
+      const fadeVox = clamp(uni.invH.mul(1.2), 2.0, 12.0);
+      const fade = smoothstep(0.0, fadeVox, edge);
 
-      const sigma = clamp(a.xyz.mul(fade), vec3(0.0), vec3(MAX_SIGMA_T)).toVar();
+      // Soft-knee extinction: compress sigma_t so dense cores stay thick smoke
+      // instead of saturating into a solid surface (linear below the knee,
+      // asymptotic to it above — replaces the hard MAX_SIGMA_T clamp).
+      const sRaw = max(a.xyz.mul(fade), vec3(0.0));
+      const sigma = exp(sRaw.negate().div(SIGMA_KNEE)).oneMinus().mul(SIGMA_KNEE).toVar();
       const loading = max(a.w.mul(fade), 0.0);
       const albedo = clamp(b.xyz.div(max(a.xyz, vec3(1e-4))), vec3(0.0), vec3(1.0));
       const scatLum = dot(b.xyz, vec3(0.2126, 0.7152, 0.0722));
@@ -159,7 +167,7 @@ export function kLightMarch(f: IslandFields, uni: IslandUniforms, atlas: VolumeA
         const lc = clamp(local, vec3(0.002), vec3(0.998));
         const uvw = uni.slotOffsetVox.add(lc.mul(float(N))).div(atlasDims);
         const sig = texture3D(atlas.texA, uvw, int(0)).xyz;
-        od.addAssign(dot(sig, vec3(0.2126, 0.7152, 0.0722)).mul(stepLen));
+        od.addAssign(dot(sig, vec3(0.2126, 0.7152, 0.0722)).mul(stepLen).mul(uni.shadowDensity));
         If(od.greaterThan(9.0), () => {
           Break();
         });

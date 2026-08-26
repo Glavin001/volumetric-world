@@ -55,6 +55,8 @@ export class VolumetricPass {
   fullSize = uniform(new THREE.Vector2(1, 1));
   halfSize = uniform(new THREE.Vector2(1, 1));
   dustShadowStrength = uniform(0.85);
+  /** Extinction multiplier for self-shadowing only (film translucency trick). */
+  shadowDensity = uniform(0.35);
   debugMode = uniform(0); // 0 off | 1 opaque distance | 2 density slice | 3 shadow slice
 
   islandCount = uniform(0);
@@ -240,13 +242,16 @@ export class VolumetricPass {
    * identical surface texture across the grid↔packet handoff.
    */
   private detailModulate(n01: any, sigLum: any) {
+    // Smoothstep-shaped response: the raw fbm value produces binary
+    // cauliflower lumps; easing it keeps billow structure but soft flanks.
+    const nS = n01.mul(n01).mul(n01.mul(-2.0).add(3.0));
     const edge = smoothstep(1.2, 0.05, sigLum);
     return clamp(
-      n01.mul(this.detailStrength).mul(1.8)
-        .add(float(1.0).sub(this.detailStrength.mul(0.72)))
-        .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
+      nS.mul(this.detailStrength).mul(1.5)
+        .add(float(1.0).sub(this.detailStrength.mul(0.6)))
+        .sub(edge.mul(this.detailStrength).mul(nS.oneMinus()).mul(0.9)),
       0.0,
-      2.1,
+      1.9,
     );
   }
 
@@ -420,7 +425,7 @@ export class VolumetricPass {
               gW.addAssign(r1.w.mul(dot(st.mul(r3.xyz), vec3(0.2126, 0.7152, 0.0722))));
               // Cheap self-shadow toward the sun.
               const od = this.packetRayOD(base, p, this.sunDir);
-              sunTrans.mulAssign(exp(od.negate().mul(0.8)));
+              sunTrans.mulAssign(exp(od.negate().mul(this.shadowDensity.mul(2.3))));
             });
           });
 
@@ -443,7 +448,7 @@ export class VolumetricPass {
             const octB = [1.0, 0.62, 0.38];
             const octC = [1.0, 0.5, 0.25];
             for (let o = 0; o < 3; o++) {
-              const ph = this.hg(cosT, g.mul(octB[o])).mul(0.85).add(this.hg(cosT, float(-0.22)).mul(0.15));
+              const ph = this.hg(cosT, g.mul(octB[o])).mul(0.75).add(this.hg(cosT, float(-0.22)).mul(0.25));
               sun.addAssign(
                 this.sunColor.mul(this.sunIntensity)
                   .mul(ph)
@@ -454,10 +459,10 @@ export class VolumetricPass {
             sun.mulAssign(powder);
             // Height-graded ambient: near the ground the cloud is lit mostly by
             // warm ground bounce; higher up the cool sky dome dominates.
-            const ambOcc = mix(0.42, 1.0, sunT).toVar();
+            const ambOcc = mix(0.55, 1.0, sunT).toVar();
             const hFac = clamp(p.y.mul(0.09), 0.0, 1.0).toVar();
-            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.0796).mul(ambOcc).mul(mix(0.55, 1.0, hFac))
-              .add(this.groundBounce.mul(0.0398).mul(ambOcc).mul(mix(1.45, 0.35, hFac)));
+            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.108).mul(ambOcc).mul(mix(0.6, 1.0, hFac))
+              .add(this.groundBounce.mul(0.054).mul(ambOcc).mul(mix(1.45, 0.35, hFac)));
 
             const S = sigS.mul(sun.add(ambient)).toVar();
             // Very-low-frequency warm/cool hue drift so large plumes don't read
@@ -559,8 +564,28 @@ export class VolumetricPass {
     return Fn(() => {
       const uvN = uv().toVar();
       const scene = this.sceneTexNode.sample(uvN).toVar();
-      const vol = this.volTexNode.sample(uvN).toVar();
       const { world } = this.reconstruct(uvN);
+
+      // Depth-aware upsample of the half-res volume: plain bilinear bleeds the
+      // volume across opaque silhouettes (blocky halos on building edges).
+      // Weight the four surrounding half-res texels by how close their opaque
+      // distance is to this pixel's — neighbours across a depth edge drop out.
+      const dCenter = length(world.sub(this.camPos)).toVar();
+      const halfTexel = vec2(1.0).div(this.halfSize).toVar();
+      const volAcc = vec4(0.0).toVar();
+      const wAcc = float(0.0).toVar();
+      const offs = [
+        [-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5],
+      ];
+      for (const [ox, oy] of offs) {
+        const uvI = clamp(uvN.add(halfTexel.mul(vec2(ox, oy))), vec2(0.001), vec2(0.999)).toVar();
+        const { world: worldI } = this.reconstruct(uvI);
+        const dI = length(worldI.sub(this.camPos));
+        const w = float(1.0).div(dI.sub(dCenter).abs().div(max(dCenter, 1.0)).mul(24.0).add(0.05)).toVar();
+        volAcc.addAssign(this.volTexNode.sample(uvI).mul(w));
+        wAcc.addAssign(w);
+      }
+      const vol = volAcc.div(max(wAcc, 1e-4)).toVar();
 
       // Dust shadows cast onto the opaque world (sun transmittance caches + packets).
       const shadowF = float(1).toVar();

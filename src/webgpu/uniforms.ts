@@ -40,6 +40,8 @@ export class IslandUniforms {
   vortEps = uniform(2.2); // vorticity confinement ε (scaled by h in kernel)
   windCouple = uniform(0.25);
   dissFactor = uniform(1); // exp(-dissipation·dt), precomputed per step
+  /** Extinction multiplier for the sun-shadow march only (film translucency trick). */
+  shadowDensity = uniform(0.35);
   settleMps = uniform(0.0);
   maxVel = uniform(35);
 

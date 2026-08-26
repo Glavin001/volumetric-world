@@ -263,6 +263,19 @@ export class VolumetricWorld {
     this.wind = w;
   }
 
+  /**
+   * Translucency: extinction multiplier used ONLY by the self-shadow paths
+   * (island sun caches + packet analytic shadows). Lower = softer, more
+   * layered light penetration; 1 = physically matched to the primary march.
+   */
+  setTranslucency(shadowDensity: number): void {
+    const v = Math.max(0.05, Math.min(1.5, shadowDensity));
+    (this.pass.shadowDensity as any).value = v;
+    for (const gpu of this.engine.islands) {
+      (gpu.uni.shadowDensity as any).value = v;
+    }
+  }
+
   // ------------------------------------------------------------------
   // Frame update
   // ------------------------------------------------------------------

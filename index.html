@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌪️</text></svg>" />
+    <title>volumetric-world — real-time dust &amp; smoke for three.js/WebGPU</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0e12; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      #view {
+        position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+        touch-action: none; /* orbit/pinch must not scroll the page */
+        -webkit-user-select: none; user-select: none; cursor: grab;
+      }
+      #view:active { cursor: grabbing; }
+      #cam-hint {
+        position: fixed; right: 12px; bottom: 12px; z-index: 5; color: #cfd8e3; font-size: 11px;
+        background: rgba(10, 14, 20, 0.55); padding: 6px 10px; border-radius: 6px; pointer-events: none;
+        transition: opacity 1.2s ease; line-height: 1.5; text-align: right;
+      }
+      #cam-hint.faded { opacity: 0; }
+      /* First person: the pointer is the aim, so show a crosshair instead of a grab hand. */
+      body.fp-mode #view { cursor: crosshair; }
+      body.fp-mode #crosshair { display: block; }
+      #crosshair {
+        display: none; position: fixed; left: 50%; top: 50%; z-index: 5; width: 14px; height: 14px;
+        margin: -7px 0 0 -7px; pointer-events: none; opacity: 0.55;
+      }
+      #crosshair::before, #crosshair::after {
+        content: ''; position: absolute; background: #eef3fa;
+      }
+      #crosshair::before { left: 6px; top: 0; width: 2px; height: 14px; }
+      #crosshair::after { left: 0; top: 6px; width: 14px; height: 2px; }
+      #vw-stats {
+        position: fixed; left: 10px; top: 10px; color: #dfe7f0; font-size: 11px; line-height: 1.45;
+        background: rgba(10, 14, 20, 0.55); padding: 8px 10px; border-radius: 6px; white-space: pre;
+        pointer-events: none; z-index: 5; backdrop-filter: blur(2px);
+      }
+      #nav {
+        position: fixed; left: 10px; bottom: 10px; z-index: 5; display: flex; gap: 6px; flex-wrap: wrap; max-width: 70vw;
+      }
+      #nav a {
+        color: #cfd8e3; text-decoration: none; font-size: 11px; background: rgba(10, 14, 20, 0.55);
+        padding: 4px 8px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.08);
+      }
+      #nav a.active { background: #3b5f8f; color: #fff; }
+      #nav a:hover { background: #2b3a4f; }
+      #loading {
+        position: fixed; inset: 0; display: grid; place-items: center; color: #9fb2c8; z-index: 4;
+        font-size: 13px; letter-spacing: 0.06em;
+      }
+      #vw-error {
+        position: fixed; inset: 0; display: grid; place-content: center; color: #e8d9c4; z-index: 10;
+        background: #14100c; padding: 32px; text-align: center; font-family: system-ui, sans-serif;
+      }
+      #vw-error code { background: #2a2018; padding: 2px 6px; border-radius: 4px; }
+      .lil-gui { z-index: 6 !important; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="loading">initializing WebGPU volumetric engine…</div>
+    <div id="nav"></div>
+    <div id="crosshair"></div>
+    <div id="cam-hint">drag to orbit · scroll / pinch to zoom · right-drag or 2-finger to pan<br />space: auto-orbit · R: reset · WASD/QE: move pivot<br /><b>F: first-person</b> — then WASD walk, drag/mouse look, Q/E height, shift run</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

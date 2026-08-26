@@ -1,6 +1,7 @@
 import GUI from 'lil-gui';
 import type { VolumetricWorld } from '../three/VolumetricWorld';
 import type { EnvCtx } from '../demo/environment';
+import type { OrbitCamera } from '../demo/orbitCamera';
 import { setSunAngles } from '../demo/environment';
 import { SCENES } from '../demo/scenes';
 import { PRESETS } from '../core/presets';
@@ -27,8 +28,10 @@ export class Hud {
   constructor(
     private world: VolumetricWorld,
     private env: EnvCtx,
+    private orbit: OrbitCamera,
     sceneId: string,
     presetName: string,
+    onDownloadReport?: () => Promise<void>,
   ) {
     this.statsEl = document.createElement('div');
     this.statsEl.id = 'vw-stats';
@@ -44,6 +47,11 @@ export class Hud {
     this.gui
       .add({ preset: presetName }, 'preset', Object.keys(PRESETS))
       .onChange((v: string) => this.reload({ preset: v }));
+    const cam = this.gui.addFolder('camera');
+    cam.add(orbit, 'autoOrbit').name('auto-orbit (space)');
+    cam.add(orbit, 'autoSpeed', -0.6, 0.6, 0.01).name('orbit speed');
+    cam.add({ reset: () => orbit.reset() }, 'reset').name('reset view (R)');
+
     const sun = this.gui.addFolder('sun');
     sun.add(c, 'sunElevation', 4, 80, 1).onChange(() => setSunAngles(env, c.sunElevation, c.sunAzimuth));
     sun.add(c, 'sunAzimuth', 0, 360, 1).onChange(() => setSunAngles(env, c.sunElevation, c.sunAzimuth));
@@ -56,6 +64,31 @@ export class Hud {
     look.add(c, 'dustShadow', 0, 1, 0.05).onChange((v: number) => ((world.pass.dustShadowStrength as { value: number }).value = v));
     look.add(c, 'debugDistance').onChange((v: boolean) => ((world.pass.debugMode as { value: number }).value = v ? 1 : 0));
     this.gui.add(c, 'paused');
+    if (onDownloadReport) {
+      let busy = false;
+      const btn = this.gui
+        .add(
+          {
+            report: async () => {
+              if (busy) return;
+              busy = true;
+              btn.name('⏳ capturing report…');
+              try {
+                await onDownloadReport();
+                btn.name('✓ report downloaded');
+              } catch (e) {
+                console.error('debug report failed', e);
+                btn.name('✖ report failed (see console)');
+              } finally {
+                busy = false;
+                setTimeout(() => btn.name('⬇ download debug report'), 2500);
+              }
+            },
+          },
+          'report',
+        )
+        .name('⬇ download debug report');
+    }
   }
 
   get paused(): boolean {
@@ -86,6 +119,7 @@ export class Hud {
         .join('\n');
       this.statsEl.textContent =
         `${this.fps.toFixed(0)} fps | sim ${w.simTime.toFixed(1)}s | gpu ${w.scheduler.gpuMsAverage.toFixed(2)}ms | q=${w.scheduler.qualityScale.toFixed(2)}\n` +
+        `cam ${this.orbit.orbitDistance.toFixed(1)}m${this.orbit.autoOrbit ? ' · auto-orbit' : ''}\n` +
         `islands ${w.scheduler.activeIslands().length}/${w.preset.slots}\n${islands}\n` +
         `packets ${w.packets.packets.length} (~${w.packets.totalMass().toFixed(0)}kg)`;
     }

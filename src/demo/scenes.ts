@@ -18,13 +18,18 @@ export interface SceneDef {
   id: string;
   title: string;
   what: string;
+  /** Scene drives the camera itself; the orbit controller stays out of the way
+   *  until the viewer grabs it (`ctx.state.userCamera` flips to true). */
+  animatesCamera?: boolean;
   setup(ctx: SceneCtx): void;
   tick?(ctx: SceneCtx, dt: number, t: number): void;
 }
 
+/** Place the camera and record the look-at point as the orbit pivot. */
 function lookAt(ctx: SceneCtx, pos: Vec3, target: Vec3): void {
   ctx.camera.position.set(pos[0], pos[1], pos[2]);
   ctx.camera.lookAt(target[0], target[1], target[2]);
+  ctx.state.camTarget = target;
 }
 
 function emitPuff(
@@ -255,6 +260,7 @@ export const SCENES: SceneDef[] = [
     id: 'inside',
     title: 'Camera inside the cloud',
     what: 'True volumetric media: the camera can enter the cloud (no billboards to break).',
+    animatesCamera: true,
     setup(ctx) {
       lookAt(ctx, [0, 2.0, 2.2], [2, 2.2, -6]);
       setSunAngles(ctx.env, 35, 160);
@@ -262,6 +268,8 @@ export const SCENES: SceneDef[] = [
       addBuilding(ctx.env, [4.5, 2.4, -6], [3, 4.8, 3], 0x8f7f6a);
     },
     tick(ctx, _dt, t) {
+      // Scripted push into the cloud — yields once the viewer takes the camera.
+      if (ctx.state.userCamera) return;
       ctx.camera.position.set(Math.sin(t * 0.12) * 1.5, 2.0 + Math.sin(t * 0.3) * 0.2, 2.2 - t * 0.12);
     },
   },

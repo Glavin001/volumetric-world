@@ -6,6 +6,8 @@
  * also shows adapter info immediately.
  */
 export class Diag {
+  /** Complete capture (uncapped) — bundled into debug reports. */
+  readonly entries: string[] = [];
   private el: HTMLDivElement;
   private lines: string[] = [];
   private seen = new Set<string>();
@@ -33,6 +35,7 @@ export class Diag {
 
   /** Informational line — shown only in verbose (?diag=1) mode. */
   info(msg: string): void {
+    this.entries.push(`i ${new Date().toISOString().slice(11, 23)} ${msg}`);
     if (!this.verbose) return;
     this.push(`ℹ ${msg}`);
     this.el.style.background = 'rgba(20,40,70,0.92)';
@@ -40,6 +43,9 @@ export class Diag {
   }
 
   log(tag: string, msg: string): void {
+    if (this.entries.length < 400) {
+      this.entries.push(`x ${new Date().toISOString().slice(11, 23)} [${tag}] ${msg}`);
+    }
     if (this.capped) return;
     const key = `${tag}:${msg.slice(0, 80)}`;
     if (this.seen.has(key)) return;

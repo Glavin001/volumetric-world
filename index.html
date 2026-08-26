@@ -7,7 +7,18 @@
     <title>volumetric-world — real-time dust &amp; smoke for three.js/WebGPU</title>
     <style>
       html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0e12; font-family: ui-monospace, Menlo, Consolas, monospace; }
-      #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+      #view {
+        position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+        touch-action: none; /* orbit/pinch must not scroll the page */
+        -webkit-user-select: none; user-select: none; cursor: grab;
+      }
+      #view:active { cursor: grabbing; }
+      #cam-hint {
+        position: fixed; right: 12px; bottom: 12px; z-index: 5; color: #cfd8e3; font-size: 11px;
+        background: rgba(10, 14, 20, 0.55); padding: 6px 10px; border-radius: 6px; pointer-events: none;
+        transition: opacity 1.2s ease; line-height: 1.5; text-align: right;
+      }
+      #cam-hint.faded { opacity: 0; }
       #vw-stats {
         position: fixed; left: 10px; top: 10px; color: #dfe7f0; font-size: 11px; line-height: 1.45;
         background: rgba(10, 14, 20, 0.55); padding: 8px 10px; border-radius: 6px; white-space: pre;
@@ -38,6 +49,7 @@
     <canvas id="view"></canvas>
     <div id="loading">initializing WebGPU volumetric engine…</div>
     <div id="nav"></div>
+    <div id="cam-hint">drag to orbit · scroll / pinch to zoom · right-drag or 2-finger to pan<br />space: auto-orbit · R: reset · WASD/QE: move pivot</div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

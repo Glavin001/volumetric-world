@@ -4,6 +4,8 @@ import { buildEnvironment } from './demo/environment';
 import { SCENES, sceneById, type SceneCtx } from './demo/scenes';
 import { Hud } from './debug/hud';
 import { Diag } from './debug/diag';
+import { PerfRing, buildDebugReport, downloadReport } from './debug/report';
+import { OrbitCamera } from './demo/orbitCamera';
 import type { Vec3 } from './core/types';
 
 declare global {
@@ -27,6 +29,14 @@ interface TestApi {
   massInRegion(min: Vec3, max: Vec3): Promise<number>;
   promoteAt(p: Vec3, r?: number): boolean;
   setDebugMode(m: number): void;
+  /** Orbit-camera controller (inspection + scripted capture angles). */
+  orbit: OrbitCamera;
+  /** Jump to an absolute orbit view; angles in degrees, distance in meters. */
+  setView(view: { yawDeg?: number; pitchDeg?: number; dist?: number; target?: Vec3 }): void;
+  /** Build the same debug report the HUD button downloads (without saving). */
+  debugReport(): Promise<Record<string, unknown>>;
+  /** Exactly what the HUD button does: build the report and auto-download it. */
+  downloadDebugReport(): Promise<void>;
 }
 
 const params = new URLSearchParams(location.search);
@@ -131,10 +141,43 @@ async function boot(): Promise<void> {
   resize();
 
   def.setup(ctx);
+
+  // Inspection camera. Scenes that animate the camera keep control until the
+  // viewer grabs it; everything else starts under a slow auto-orbit so the
+  // volumetrics show parallax and self-shadowing while the sim runs.
+  const orbit = new OrbitCamera({
+    enabled: !testMode && !def.animatesCamera,
+    autoOrbit: params.get('autoOrbit') !== '0',
+    autoSpeedRadPerS: Number(params.get('orbitSpeed') ?? 0.13),
+  });
+  orbit.captureFromCamera(camera, (ctx.state.camTarget as Vec3 | undefined) ?? [0, 1.5, 0]);
+  if (!testMode) {
+    orbit.onEngage = () => {
+      ctx.state.userCamera = true;
+      document.getElementById('cam-hint')?.classList.add('faded');
+    };
+    orbit.attach(canvas, camera);
+    window.setTimeout(() => document.getElementById('cam-hint')?.classList.add('faded'), 9000);
+  }
+
   world.setCamera(camera);
   camera.updateMatrixWorld();
 
   let sceneTime = 0;
+
+  const perf = new PerfRing();
+  const makeReport = async (): Promise<Record<string, unknown>> => {
+    // Grab a JPEG of the current frame first (uses the readback path briefly),
+    // then bundle state + metrics + perf + logs.
+    let frameDataUrl: string | undefined;
+    try {
+      frameDataUrl = await world.captureFrame(scene, camera);
+    } catch (e) {
+      diag.log('report', `frame capture failed: ${String(e)}`);
+    }
+    return buildDebugReport(world, diag, { sceneId, presetName, perf, frameDataUrl });
+  };
+  const downloadDebugReport = async (): Promise<void> => downloadReport(await makeReport(), sceneId);
 
   const api: TestApi = {
     world,
@@ -147,7 +190,9 @@ async function boot(): Promise<void> {
         def.tick?.(ctx, dt, sceneTime);
         camera.updateMatrixWorld();
         world.setCamera(camera);
+        const t0 = performance.now();
         world.stepAll(dt);
+        perf.push({ dt: dt * 1000, updateMs: performance.now() - t0, renderMs: 0 });
       }
     },
     async render() {
@@ -193,6 +238,14 @@ async function boot(): Promise<void> {
     setDebugMode(m: number) {
       (world.pass.debugMode as { value: number }).value = m;
     },
+    orbit,
+    setView(view) {
+      orbit.snapTo(camera, view);
+      camera.updateMatrixWorld();
+      world.setCamera(camera);
+    },
+    debugReport: makeReport,
+    downloadDebugReport,
   };
   window.__vw = api;
 
@@ -208,7 +261,7 @@ async function boot(): Promise<void> {
     return;
   }
 
-  const hud = new Hud(world, env, sceneId, presetName);
+  const hud = new Hud(world, env, orbit, sceneId, presetName, downloadDebugReport);
   let last = performance.now();
   const loop = (): void => {
     requestAnimationFrame(loop);
@@ -218,11 +271,19 @@ async function boot(): Promise<void> {
     if (!hud.paused) {
       sceneTime += dt;
       def.tick?.(ctx, dt, sceneTime);
-      camera.updateMatrixWorld();
-      world.update(dt, camera);
     }
+    // The camera keeps orbiting even while the sim is paused, so a frozen
+    // moment can be inspected from every side.
+    orbit.update(dt, camera);
+    camera.updateMatrixWorld();
+    const t0 = performance.now();
+    if (!hud.paused) world.update(dt, camera);
+    else world.setCamera(camera);
+    const t1 = performance.now();
     world.render(scene, camera);
     void present();
+    const t2 = performance.now();
+    perf.push({ dt: dt * 1000, updateMs: t1 - t0, renderMs: t2 - t1 });
     hud.update();
   };
   window.__vwReady = true;

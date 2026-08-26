@@ -667,6 +667,33 @@ export class VolumetricWorld {
     this.resolveGpuTimings();
   }
 
+  /**
+   * Capture the current composited frame as a JPEG data URL (for debug
+   * reports). Renders one extra frame through the readback target so it works
+   * even when presenting straight to the canvas.
+   */
+  async captureFrame(scene: THREE.Scene, camera: THREE.PerspectiveCamera, maxW = 640): Promise<string> {
+    const pass = this.pass;
+    const prevMode = pass.presentMode;
+    pass.ensureOutRT();
+    pass.presentMode = 'readback';
+    try {
+      this.render(scene, camera);
+      const full = document.createElement('canvas');
+      const ctx = full.getContext('2d');
+      if (!ctx) return '';
+      await pass.blitToCanvas2D(ctx);
+      const scale = Math.min(1, maxW / Math.max(full.width, 1));
+      const small = document.createElement('canvas');
+      small.width = Math.max(1, Math.round(full.width * scale));
+      small.height = Math.max(1, Math.round(full.height * scale));
+      small.getContext('2d')!.drawImage(full, 0, 0, small.width, small.height);
+      return small.toDataURL('image/jpeg', 0.72);
+    } finally {
+      pass.presentMode = prevMode;
+    }
+  }
+
   private syncRenderUniforms(): void {
     const pass = this.pass;
     const sunD = norm(this.sun.dir);

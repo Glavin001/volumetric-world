@@ -130,14 +130,18 @@ export class VolumetricPass {
     this.outRT?.setSize(w, h);
   }
 
-  enableReadbackPresent(): void {
-    this.presentMode = 'readback';
+  ensureOutRT(): void {
     if (!this.outRT) {
       this.outRT = new THREE.RenderTarget(this.sceneRT.width, this.sceneRT.height, {
         type: THREE.UnsignedByteType,
       });
       this.outRT.texture.name = 'finalOut';
     }
+  }
+
+  enableReadbackPresent(): void {
+    this.presentMode = 'readback';
+    this.ensureOutRT();
   }
 
   /** Read the composite target and draw it into a 2D canvas (readback mode). */
@@ -415,6 +419,10 @@ export class VolumetricPass {
             // The 8-bit shadow cache can quantize deep-core transmittance to
             // exactly 0, which would kill every octave — floor it first.
             const sunT = max(sunTrans, 0.004).toVar();
+            // Powder term (sun only): thin wisps back-scatter less than Beer
+            // alone predicts, which keeps edges translucent instead of chalky.
+            // Dense cores saturate to 1 so interior lighting is untouched.
+            const powder = mix(exp(sLum.mul(-2.4)).oneMinus(), float(1.0), 0.35).toVar();
             const sun = vec3(0.0).toVar();
             const octA = [1.0, 0.55, 0.3];
             const octB = [1.0, 0.62, 0.38];
@@ -428,11 +436,21 @@ export class VolumetricPass {
                   .mul(octA[o]),
               );
             }
+            sun.mulAssign(powder);
+            // Height-graded ambient: near the ground the cloud is lit mostly by
+            // warm ground bounce; higher up the cool sky dome dominates.
             const ambOcc = mix(0.42, 1.0, sunT).toVar();
-            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.0796).mul(ambOcc)
-              .add(this.groundBounce.mul(0.0398).mul(ambOcc));
+            const hFac = clamp(p.y.mul(0.09), 0.0, 1.0).toVar();
+            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.0796).mul(ambOcc).mul(mix(0.55, 1.0, hFac))
+              .add(this.groundBounce.mul(0.0398).mul(ambOcc).mul(mix(1.45, 0.35, hFac)));
 
             const S = sigS.mul(sun.add(ambient)).toVar();
+            // Very-low-frequency warm/cool hue drift so large plumes don't read
+            // as one flat color (gated with detail: off on software adapters).
+            If(this.detailStrength.greaterThan(0.01), () => {
+              const tn = this.valueNoise(p.mul(0.05)).mul(0.5).add(0.5);
+              S.mulAssign(mix(vec3(1.05, 1.0, 0.94), vec3(0.94, 0.985, 1.06), tn));
+            });
             const Tstep = exp(sLum.negate().mul(ds)).toVar();
             const w = T.mul(Tstep.oneMinus()).toVar();
             radiance.addAssign(S.div(sLum).mul(w));

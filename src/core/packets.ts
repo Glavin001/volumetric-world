@@ -50,6 +50,12 @@ export interface PacketSystemOptions {
 
 export class PacketSystem {
   packets: VolumePacket[] = [];
+  /**
+   * Packets consumed by a grid promotion, kept ONLY for rendering while they
+   * fade out (the island fades in over the same window). Excluded from
+   * physics, mass accounting and merging so nothing double-counts.
+   */
+  readonly dying: VolumePacket[] = [];
   readonly maxPackets: number;
   groundY: number;
   dissipation: number;
@@ -106,7 +112,9 @@ export class PacketSystem {
       ageSeconds: 0,
       seed,
       fade,
-      detailScaleM: material.detail.baseScaleM * 1.6,
+      // Same world-space detail scale the island render path uses (meta m2.w):
+      // any fudge factor here would desynchronize the noise across a handoff.
+      detailScaleM: material.detail.baseScaleM,
     });
   }
 
@@ -164,6 +172,15 @@ export class PacketSystem {
       p.radii[1] += grow * 0.6;
       p.radii[2] += grow;
 
+      // Aspect guard: splits and ground pancaking can leave a packet metres
+      // long but only ~0.25 m thin, which renders as a bright "glass shard".
+      // Thicken the thin axes (mass is conserved; peak density drops).
+      const maxR = Math.max(p.radii[0], p.radii[1], p.radii[2]);
+      const minAllowed = maxR / 5;
+      p.radii[0] = Math.max(p.radii[0], minAllowed);
+      p.radii[1] = Math.max(p.radii[1], minAllowed);
+      p.radii[2] = Math.max(p.radii[2], minAllowed);
+
       // Ground contact: clamp and pancake (gravity-current flavored spreading).
       const floor = this.groundY + p.radii[1] * 0.55;
       if (p.position[1] < floor) {
@@ -178,6 +195,15 @@ export class PacketSystem {
 
       p.massKg *= Math.exp(-this.dissipation * dt);
     }
+
+    // Render-only fade-out of promoted packets: keep drifting, fade to zero.
+    for (const p of this.dying) {
+      p.fade -= dt / 0.3;
+      p.position[0] += p.velocity[0] * dt;
+      p.position[1] += p.velocity[1] * dt;
+      p.position[2] += p.velocity[2] * dt;
+    }
+    this.dying.splice(0, this.dying.length, ...this.dying.filter((p) => p.fade > 0.01));
 
     this.mergeAndSplit();
 
@@ -201,30 +227,7 @@ export class PacketSystem {
         const rb = Math.max(...b.radii);
         const dv = len(sub(a.velocity, b.velocity));
         if (d < 0.55 * (ra + rb) && dv < 1.2) {
-          const m = a.massKg + b.massKg;
-          const wa = a.massKg / m;
-          const wb = b.massKg / m;
-          for (let c = 0; c < 3; c++) {
-            const mean = a.position[c] * wa + b.position[c] * wb;
-            const va =
-              wa * (a.radii[c] ** 2 + (a.position[c] - mean) ** 2) +
-              wb * (b.radii[c] ** 2 + (b.position[c] - mean) ** 2);
-            a.position[c] = mean;
-            a.radii[c] = Math.sqrt(va);
-            a.velocity[c] = a.velocity[c] * wa + b.velocity[c] * wb;
-            a.extPerMassRgb = [
-              a.extPerMassRgb[0] * wa + b.extPerMassRgb[0] * wb,
-              a.extPerMassRgb[1] * wa + b.extPerMassRgb[1] * wb,
-              a.extPerMassRgb[2] * wa + b.extPerMassRgb[2] * wb,
-            ];
-            a.albedoRgb = [
-              a.albedoRgb[0] * wa + b.albedoRgb[0] * wb,
-              a.albedoRgb[1] * wa + b.albedoRgb[1] * wb,
-              a.albedoRgb[2] * wa + b.albedoRgb[2] * wb,
-            ];
-            a.phaseG = a.phaseG * wa + b.phaseG * wb;
-          }
-          a.massKg = m;
+          PacketSystem.foldInto(a, b);
           b.massKg = 0;
         }
       }
@@ -265,12 +268,62 @@ export class PacketSystem {
 
   private enforceBudget(): void {
     if (this.packets.length <= this.maxPackets) return;
-    // Drop the least optically significant packets first.
+    // Keep the most optically significant packets; the overflow is FOLDED into
+    // each one's nearest survivor (moment-matched merge) rather than deleted —
+    // the budget is a level-of-detail decision and must never destroy mass.
     this.packets.sort(
       (a, b) =>
         PacketSystem.peakSigmaT(b) * Math.max(...b.radii) - PacketSystem.peakSigmaT(a) * Math.max(...a.radii),
     );
-    this.packets.length = this.maxPackets;
+    const survivors = this.packets.slice(0, this.maxPackets);
+    const overflow = this.packets.slice(this.maxPackets);
+    for (const p of overflow) {
+      let best = survivors[0];
+      let bestD = Infinity;
+      for (const s of survivors) {
+        const d = len(sub(p.position, s.position));
+        if (d < bestD) {
+          bestD = d;
+          best = s;
+        }
+      }
+      PacketSystem.foldInto(best, p);
+    }
+    this.packets = survivors;
+  }
+
+  /** Moment-matched absorb of `b` into `a` (mass, position, spread, velocity, optics). */
+  private static foldInto(a: VolumePacket, b: VolumePacket): void {
+    const m = a.massKg + b.massKg;
+    if (m <= 0) return;
+    const wa = a.massKg / m;
+    const wb = b.massKg / m;
+    for (let c = 0; c < 3; c++) {
+      const mean = a.position[c] * wa + b.position[c] * wb;
+      const va =
+        wa * (a.radii[c] ** 2 + (a.position[c] - mean) ** 2) +
+        wb * (b.radii[c] ** 2 + (b.position[c] - mean) ** 2);
+      a.position[c] = mean;
+      a.radii[c] = Math.sqrt(va);
+      a.velocity[c] = a.velocity[c] * wa + b.velocity[c] * wb;
+    }
+    a.extPerMassRgb = [
+      a.extPerMassRgb[0] * wa + b.extPerMassRgb[0] * wb,
+      a.extPerMassRgb[1] * wa + b.extPerMassRgb[1] * wb,
+      a.extPerMassRgb[2] * wa + b.extPerMassRgb[2] * wb,
+    ];
+    a.albedoRgb = [
+      a.albedoRgb[0] * wa + b.albedoRgb[0] * wb,
+      a.albedoRgb[1] * wa + b.albedoRgb[1] * wb,
+      a.albedoRgb[2] * wa + b.albedoRgb[2] * wb,
+    ];
+    a.phaseG = a.phaseG * wa + b.phaseG * wb;
+    a.massKg = m;
+  }
+
+  /** Hand packets to the render-only fade-out list (promotion crossfade). */
+  retireVisual(list: VolumePacket[]): void {
+    for (const p of list) this.dying.push(p);
   }
 
   /** Remove and return packets intersecting the given AABB (for packet→grid promotion). */
@@ -291,9 +344,11 @@ export class PacketSystem {
 
 /**
  * Build packets from a coarse (RES³) mass grid read back from an island:
- * groups cells into octants and moment-matches each into one Gaussian packet.
- * `grid` holds vec4 per coarse cell: (mass, Σm·x, Σm·y, Σm·z) with x,y,z in
- * island-local meters.
+ * groups cells into div³ groups (octants by default, 4³ for structured plumes)
+ * and moment-matches each into one Gaussian packet. `grid` holds vec4 per
+ * coarse cell: (mass, Σm·x, Σm·y, Σm·z) with x,y,z in island-local meters;
+ * the optional momentum grid holds (Σm·vx, Σm·vy, Σm·vz, Σm) so each packet
+ * inherits its group's mass-weighted mean velocity.
  */
 export function packetsFromCoarseGrid(
   grid: Float32Array,
@@ -301,11 +356,23 @@ export function packetsFromCoarseGrid(
   origin: Vec3,
   sizeM: number,
   minMassKg = 0.01,
-): { position: Vec3; radii: Vec3; massKg: number }[] {
-  const half = res / 2;
+  opts: {
+    /** Mass-weighted momentum grid (vec4/cell: Σm·vx, Σm·vy, Σm·vz, Σm) — same layout as `grid`. */
+    momentum?: Float32Array;
+    /** Groups per axis (2 = octants, 4 = 64 candidate groups for structured plumes). */
+    div?: number;
+  } = {},
+): { position: Vec3; radii: Vec3; massKg: number; velocity: Vec3 }[] {
+  const div = opts.div ?? 2;
   const cellM = sizeM / res;
-  interface Acc { m: number; x: number; y: number; z: number; xx: number; yy: number; zz: number }
-  const acc: Acc[] = Array.from({ length: 8 }, () => ({ m: 0, x: 0, y: 0, z: 0, xx: 0, yy: 0, zz: 0 }));
+  const groupSize = res / div;
+  interface Acc {
+    m: number; x: number; y: number; z: number; xx: number; yy: number; zz: number;
+    pvx: number; pvy: number; pvz: number; pm: number;
+  }
+  const acc: Acc[] = Array.from({ length: div * div * div }, () => ({
+    m: 0, x: 0, y: 0, z: 0, xx: 0, yy: 0, zz: 0, pvx: 0, pvy: 0, pvz: 0, pm: 0,
+  }));
   for (let z = 0; z < res; z++) {
     for (let y = 0; y < res; y++) {
       for (let x = 0; x < res; x++) {
@@ -315,26 +382,40 @@ export function packetsFromCoarseGrid(
         const cx = m > 1e-9 ? grid[i + 1] / m : (x + 0.5) * cellM;
         const cy = m > 1e-9 ? grid[i + 2] / m : (y + 0.5) * cellM;
         const cz = m > 1e-9 ? grid[i + 3] / m : (z + 0.5) * cellM;
-        const o = (x >= half ? 1 : 0) + (y >= half ? 2 : 0) + (z >= half ? 4 : 0);
-        const a = acc[o];
+        const gx = Math.min(div - 1, Math.floor(x / groupSize));
+        const gy = Math.min(div - 1, Math.floor(y / groupSize));
+        const gz = Math.min(div - 1, Math.floor(z / groupSize));
+        const a = acc[gx + gy * div + gz * div * div];
         a.m += m;
         a.x += m * cx; a.y += m * cy; a.z += m * cz;
         a.xx += m * cx * cx; a.yy += m * cy * cy; a.zz += m * cz * cz;
+        if (opts.momentum) {
+          a.pvx += opts.momentum[i];
+          a.pvy += opts.momentum[i + 1];
+          a.pvz += opts.momentum[i + 2];
+          a.pm += opts.momentum[i + 3];
+        }
       }
     }
   }
-  const out: { position: Vec3; radii: Vec3; massKg: number }[] = [];
+  const out: { position: Vec3; radii: Vec3; massKg: number; velocity: Vec3 }[] = [];
   for (const a of acc) {
     if (a.m < minMassKg) continue;
     const mx = a.x / a.m, my = a.y / a.m, mz = a.z / a.m;
     const vx = Math.max(a.xx / a.m - mx * mx, 0.04);
     const vy = Math.max(a.yy / a.m - my * my, 0.04);
     const vz = Math.max(a.zz / a.m - mz * mz, 0.04);
+    // Mass-weighted mean velocity: exported packets inherit the plume's real
+    // outgoing motion (an expanding front keeps expanding as packets).
+    const velocity: Vec3 = a.pm > 1e-9
+      ? [a.pvx / a.pm, a.pvy / a.pm, a.pvz / a.pm]
+      : [0, 0, 0];
     out.push({
       position: [origin[0] + mx, origin[1] + my, origin[2] + mz],
       // Slightly inflate: a Gaussian with σ=std underestimates the visual footprint.
       radii: [Math.sqrt(vx) * 1.35 + cellM, Math.sqrt(vy) * 1.35 + cellM, Math.sqrt(vz) * 1.35 + cellM],
       massKg: a.m,
+      velocity,
     });
   }
   return out;

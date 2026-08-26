@@ -15,7 +15,11 @@ import {
   ActiveEmission, ActiveEffector, WorldPrim, activateEmission, effectorDuration, flattenShape,
   packEffectors, packEvents, packPrims, packPromo, primFromBody, sourceBoundR, sourceCenter,
 } from '../webgpu/packing';
-import { VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE } from './volumetricPass';
+import { MAX_PROMO, configureSweep } from '../webgpu/uniforms';
+import {
+  VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE,
+  TILE_PX, MAX_TILES, MAX_PER_TILE, TILE_STRIDE, MAX_HEAVY,
+} from './volumetricPass';
 import { QID } from '../core/math';
 import type { AerosolMaterial, QualityPreset } from '../core/types';
 
@@ -92,6 +96,8 @@ export class VolumetricWorld {
   private effectors: ActiveEffector[] = [];
   private islandMaterial = new Map<number, AerosolMaterial>();
   private retireJobs: RetireJob[] = [];
+  private reboxJobs: { oldIsland: IslandState; newIsland: IslandState; end: number }[] = [];
+  private lastReboxAt = -10;
   private readbackChain: Promise<unknown> = Promise.resolve();
   private lastPacketUpdate = 0;
   private lastPromoteCheck = 0;
@@ -226,6 +232,9 @@ export class VolumetricWorld {
       }
     }
     if (island) {
+      // Ownership: exactly one island injects this emission, even when several
+      // overlap the source region (overlapping injection double-counted mass).
+      em.ownerSlot = island.slot;
       island.lastEventAt = this.simTime;
       island.estimatedMassKg += ev.fineMassKg;
       this.islandMaterial.set(island.slot, material);
@@ -260,6 +269,19 @@ export class VolumetricWorld {
 
   setWind(w: Vec3): void {
     this.wind = w;
+  }
+
+  /**
+   * Translucency: extinction multiplier used ONLY by the self-shadow paths
+   * (island sun caches + packet analytic shadows). Lower = softer, more
+   * layered light penetration; 1 = physically matched to the primary march.
+   */
+  setTranslucency(shadowDensity: number): void {
+    const v = Math.max(0.05, Math.min(1.5, shadowDensity));
+    (this.pass.shadowDensity as any).value = v;
+    for (const gpu of this.engine.islands) {
+      (gpu.uni.shadowDensity as any).value = v;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -297,7 +319,7 @@ export class VolumetricWorld {
     this.scheduler.updateImportance(this.simTime, this.cameraInfo);
     this.beginRetirements();
     for (const island of this.scheduler.activeIslands()) {
-      if (!island.retiring) {
+      if (!island.retiring && !island.reboxing) {
         this.stepIsland(island, dt);
         island.lastStepAt = this.simTime;
         island.stepCount++;
@@ -307,12 +329,21 @@ export class VolumetricWorld {
   }
 
   private commonUpdate(dt: number, force = false): void {
+    this.updateReboxes();
+
     // Far-field packets at ~10 Hz.
     if (force || this.simTime - this.lastPacketUpdate >= 0.1) {
       const pdt = force ? dt : Math.min(this.simTime - this.lastPacketUpdate, 0.25);
       this.lastPacketUpdate = this.simTime;
       this.applyBodyWakesToPackets(pdt);
       this.packets.update(pdt, this.wind);
+    }
+
+    // Fade-in for freshly promoted/reboxed islands (their source fades out).
+    for (const island of this.scheduler.activeIslands()) {
+      if (!island.retiring && !island.reboxing && island.renderFade < 1) {
+        island.renderFade = Math.min(1, island.renderFade + dt / 0.3);
+      }
     }
 
     // Retire fades → free slots.
@@ -328,10 +359,11 @@ export class VolumetricWorld {
       }
     }
 
-    // Packet→grid promotion checks (2 Hz).
+    // Packet→grid promotion checks + island overlap resolution (2 Hz).
     if (this.simTime - this.lastPromoteCheck > 0.5) {
       this.lastPromoteCheck = this.simTime;
       this.autoPromote();
+      this.resolveIslandOverlaps();
     }
 
     // Expired emissions/effectors cleanup.
@@ -346,7 +378,7 @@ export class VolumetricWorld {
 
   private configureIslandPlacement(island: IslandState): void {
     const gpu = this.gpuFor(island);
-    const h = island.sizeM / this.preset.slotRes;
+    const h = island.sizeM / gpu.N;
     (gpu.uni.origin.value as THREE.Vector3).set(island.origin[0], island.origin[1], island.origin[2]);
     (gpu.uni.h as any).value = h;
     (gpu.uni.invH as any).value = 1 / h;
@@ -393,7 +425,7 @@ export class VolumetricWorld {
     const material = this.islandMaterial.get(island.slot) ?? getMaterial('concrete');
 
     // --- scrolling: follow the tracked focus in integer voxel increments ---
-    const h = island.sizeM / this.preset.slotRes;
+    const h = island.sizeM / gpu.N;
     const drift = sub(island.focus, island.center);
     const driftLen = len([drift[0], 0, drift[2]]);
     if (driftLen > island.sizeM * 0.16) {
@@ -402,7 +434,7 @@ export class VolumetricWorld {
         0,
         Math.round(drift[2] / h),
       ];
-      const maxShift = Math.floor(this.preset.slotRes / 4);
+      const maxShift = Math.floor(gpu.N / 4);
       shift[0] = Math.max(-maxShift, Math.min(maxShift, shift[0]));
       shift[2] = Math.max(-maxShift, Math.min(maxShift, shift[2]));
       if (shift[0] !== 0 || shift[2] !== 0) {
@@ -420,7 +452,12 @@ export class VolumetricWorld {
     const bmin: Vec3 = [...island.origin] as Vec3;
     const bmax: Vec3 = [island.origin[0] + island.sizeM, island.origin[1] + island.sizeM, island.origin[2] + island.sizeM];
     packPrims(uni, this.buildPrimList(island), bmin, bmax);
-    packEvents(uni, this.overlappingEmissions(bmin, bmax), this.simTime, (id) => this.bodies.get(id)?.linearVelocityMps);
+    packEvents(
+      uni,
+      this.overlappingEmissions(bmin, bmax).filter((em) => em.ownerSlot === island.slot),
+      this.simTime,
+      (id) => this.bodies.get(id)?.linearVelocityMps,
+    );
     packEffectors(uni, this.effectors, this.simTime, dt);
 
     (uni.dt as any).value = dt;
@@ -432,7 +469,10 @@ export class VolumetricWorld {
     (uni.sunDir.value as THREE.Vector3).set(this.sun.dir[0], this.sun.dir[1], this.sun.dir[2]);
 
     const light = this.scheduler.lightDue(island, this.simTime);
-    if (light) island.lastLightAt = this.simTime;
+    if (light) {
+      island.lastLightAt = this.simTime;
+      configureSweep(uni, norm(this.sun.dir), gpu.N, island.sizeM / gpu.N);
+    }
     gpu.step({ light, metrics: this.metricsEnabled });
     island.estimatedMassKg *= Math.exp(-material.dissipationPerSecond * dt);
     if (this.metricsEnabled) this.pollDivStats();
@@ -495,6 +535,8 @@ export class VolumetricWorld {
       if (!island.active) return;
       gpu.computeMassGrid();
       const grid = await this.engine.readField(this.engine.scratch.coarseMass);
+      gpu.computeMomentumGrid();
+      const mom = await this.engine.readField(this.engine.scratch.coarseMom);
       let mass = 0;
       for (let i = 0; i < grid.length; i += 4) mass += grid[i];
       island.massKg = mass;
@@ -533,11 +575,32 @@ export class VolumetricWorld {
             }
           }
         }
-        const protos = packetsFromCoarseGrid(shellGrid, c, island.origin, island.sizeM, 0.05);
-        for (const p of protos) {
-          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg * 0.92, [...this.wind] as Vec3, island.slot, 0.35);
+        // The momentum grid is masked to the same shell cells so the group
+        // means reflect only exported material.
+        const shellMom = new Float32Array(mom.length);
+        for (let z = 0; z < c; z++) {
+          for (let y = 0; y < c; y++) {
+            for (let x = 0; x < c; x++) {
+              const i = (x + y * c + z * c * c) * 4;
+              const isShell = !(x > 0 && x < c - 1 && y > 0 && y < c - 1 && z > 0 && z < c - 1);
+              if (isShell) {
+                shellMom[i] = mom[i];
+                shellMom[i + 1] = mom[i + 1];
+                shellMom[i + 2] = mom[i + 2];
+                shellMom[i + 3] = mom[i + 3];
+              }
+            }
+          }
         }
-        gpu.clearShell(0, this.preset.slotRes / COARSE);
+        const protos = packetsFromCoarseGrid(shellGrid, c, island.origin, island.sizeM, 0.05, {
+          momentum: shellMom,
+        });
+        for (const p of protos) {
+          // Momentum-conserving handoff: the packet keeps the outgoing fluid
+          // velocity (wind takes over gradually via the packet drag model).
+          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, p.velocity, island.slot, 0.35);
+        }
+        gpu.clearShell(0, gpu.N / COARSE);
         island.lastExportAt = this.simTime;
       }
     });
@@ -553,14 +616,112 @@ export class VolumetricWorld {
       this.enqueueReadback(async () => {
         gpu.computeMassGrid();
         const grid = await this.engine.readField(this.engine.scratch.coarseMass);
+        gpu.computeMomentumGrid();
+        const mom = await this.engine.readField(this.engine.scratch.coarseMom);
         const material = this.islandMaterial.get(island.slot) ?? getMaterial('concrete');
-        const protos = packetsFromCoarseGrid(grid, COARSE, island.origin, island.sizeM, 0.03);
+        // Retirement is a full-plume export: 4³ moment groups keep the plume's
+        // structure (an octant match collapses it into one featureless dome),
+        // and each packet inherits its group's mass-weighted fluid velocity.
+        const protos = packetsFromCoarseGrid(grid, COARSE, island.origin, island.sizeM, 0.03, {
+          momentum: mom,
+          div: 4,
+        });
         for (const p of protos) {
-          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, [...this.wind] as Vec3, island.slot, 0);
+          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, p.velocity, island.slot, 0);
         }
         job.phase = 'fading';
         job.fadeEnd = this.simTime + 0.35;
       });
+    }
+  }
+
+  /**
+   * Viewer-centric re-tiering: when an island's resolution class has disagreed
+   * with its camera-relative need for a while (hysteresis in the scheduler),
+   * resample it in place into a slot of the right class — GPU-only, no packet
+   * round-trip — and crossfade the two slots so nothing pops. One job at a
+   * time, rate-limited.
+   */
+  private updateReboxes(): void {
+    // Finish jobs whose crossfade elapsed.
+    for (const job of [...this.reboxJobs]) {
+      job.oldIsland.renderFade = Math.max(0, (job.end - this.simTime) / 0.3);
+      if (this.simTime >= job.end) {
+        this.gpuFor(job.oldIsland).reset();
+        this.scheduler.free(job.oldIsland);
+        this.reboxJobs.splice(this.reboxJobs.indexOf(job), 1);
+      }
+    }
+    if (this.reboxJobs.length > 0 || this.simTime - this.lastReboxAt < 1) return;
+
+    const candidate = this.scheduler
+      .activeIslands()
+      .filter((i) => !i.retiring && !i.reboxing && i.classMismatchSince !== Infinity &&
+        this.simTime - i.classMismatchSince > 1.5)
+      .sort((a, b) => b.importance - a.importance)[0];
+    if (!candidate) return;
+
+    const wanted = this.scheduler.classFor(candidate.center, this.cameraInfo);
+    const fresh = this.scheduler.allocate(
+      { center: [...candidate.center] as Vec3, tier: candidate.tier, reason: 'rebox', cls: wanted },
+      this.simTime, this.cameraInfo,
+    );
+    if (!fresh) return; // no free slot of the target class — try again later
+
+    // Same geometry, same state — only the resolution changes.
+    fresh.sizeM = candidate.sizeM;
+    fresh.center = [...candidate.center] as [number, number, number];
+    fresh.origin = [...candidate.origin] as [number, number, number];
+    fresh.focus = [...candidate.focus] as [number, number, number];
+    fresh.massKg = candidate.massKg;
+    fresh.estimatedMassKg = candidate.estimatedMassKg;
+    fresh.interactionCount = candidate.interactionCount;
+    fresh.lastEventAt = candidate.lastEventAt;
+    fresh.importance = candidate.importance;
+    fresh.renderFade = 0;
+    const material = this.islandMaterial.get(candidate.slot);
+    if (material) this.islandMaterial.set(fresh.slot, material);
+
+    this.configureIslandPlacement(fresh);
+    const freshGpu = this.gpuFor(fresh);
+    freshGpu.reset();
+    configureSweep(freshGpu.uni, norm(this.sun.dir), freshGpu.N, fresh.sizeM / freshGpu.N);
+    freshGpu.reboxFrom(this.gpuFor(candidate), candidate.origin, candidate.sizeM);
+    fresh.lastLightAt = this.simTime;
+
+    for (const em of this.emissions) {
+      if (em.ownerSlot === candidate.slot) em.ownerSlot = fresh.slot;
+    }
+    candidate.reboxing = true;
+    this.reboxJobs.push({ oldIsland: candidate, newIsland: fresh, end: this.simTime + 0.3 });
+    this.lastReboxAt = this.simTime;
+  }
+
+  /**
+   * Two active fluid islands are two INDEPENDENT simulations: where they
+   * overlap heavily the medium is double-rendered and both fields evolve
+   * unaware of each other. Retire the less important one — its mass exports
+   * to packets with momentum and crossfades, and the survivor's emissions
+   * ownership keeps sources single-counted.
+   */
+  private resolveIslandOverlaps(): void {
+    const act = this.scheduler.activeIslands().filter((i) => !i.retiring && !i.reboxing);
+    for (let a = 0; a < act.length; a++) {
+      for (let b = a + 1; b < act.length; b++) {
+        const A = act[a];
+        const B = act[b];
+        let overlapVol = 1;
+        for (let c = 0; c < 3; c++) {
+          const lo = Math.max(A.origin[c], B.origin[c]);
+          const hi = Math.min(A.origin[c] + A.sizeM, B.origin[c] + B.sizeM);
+          overlapVol *= Math.max(0, hi - lo);
+        }
+        const smallerVol = Math.min(A.sizeM ** 3, B.sizeM ** 3);
+        if (overlapVol > smallerVol * 0.55) {
+          const loser = A.importance < B.importance ? A : B;
+          loser.retiring = true;
+        }
+      }
     }
   }
 
@@ -614,9 +775,19 @@ export class VolumetricWorld {
     this.configureIslandPlacement(island);
     const gpu = this.gpuFor(island);
     gpu.reset();
-    packPromo(gpu.uni, cluster);
+    // The GPU can only voxelize MAX_PROMO packets — inject the heaviest and
+    // RETURN the rest to the pool (they used to vanish, silently losing mass).
+    cluster.sort((a, b) => b.massKg - a.massKg);
+    const injected = cluster.slice(0, MAX_PROMO);
+    for (const p of cluster.slice(MAX_PROMO)) this.packets.packets.push(p);
+    const injectedMass = injected.reduce((m, p) => m + p.massKg, 0);
+    packPromo(gpu.uni, injected);
     gpu.injectPromotedPackets();
-    island.estimatedMassKg = mass;
+    // Crossfade: the island rises from 0 while the consumed packets keep
+    // rendering and fade out over the same window — promotion used to pop.
+    island.renderFade = 0;
+    this.packets.retireVisual(injected);
+    island.estimatedMassKg = injectedMass;
     island.lastEventAt = this.simTime;
     this.promoteCooldownUntil = this.simTime + 3;
     return true;
@@ -662,7 +833,7 @@ export class VolumetricWorld {
   }
 
   render(scene: THREE.Scene, camera: THREE.PerspectiveCamera): void {
-    this.syncRenderUniforms();
+    this.syncRenderUniforms(camera);
     this.pass.render(scene, camera);
     this.resolveGpuTimings();
   }
@@ -694,7 +865,7 @@ export class VolumetricWorld {
     }
   }
 
-  private syncRenderUniforms(): void {
+  private syncRenderUniforms(camera: THREE.PerspectiveCamera): void {
     const pass = this.pass;
     const sunD = norm(this.sun.dir);
     (pass.sunDir.value as THREE.Vector3).set(sunD[0], sunD[1], sunD[2]);
@@ -715,19 +886,25 @@ export class VolumetricWorld {
       const so = gpu.uni.slotOffsetVox.value as THREE.Vector3;
       meta[b + 0].set(island.origin[0], island.origin[1], island.origin[2], island.sizeM);
       meta[b + 1].set(so.x, so.y, so.z, active ? 1 : 0);
-      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, 0, 0);
+      // m2.zw: slot resolution (mixed-res pool) and material detail scale —
+      // the same world-space noise scale the packets carry, so both
+      // representations sample one continuous detail field.
+      const detailScaleM = this.islandMaterial.get(island.slot)?.detail.baseScaleM ?? 1.4;
+      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, gpu.N, detailScaleM);
       if (active) count++;
     }
     (pass.islandCount as any).value = count;
 
-    // Nearest packets for rendering.
+    // Nearest packets for rendering (the dying list renders during promotion
+    // crossfades but is excluded from physics/mass).
     const cam = this.cameraInfo.position;
-    const sorted = [...this.packets.packets].sort(
+    const sorted = [...this.packets.packets, ...this.packets.dying].sort(
       (a, b) => len(sub(a.position, cam)) - len(sub(b.position, cam)),
     );
     const parr = (pass.packets as any).array as THREE.Vector4[];
     const maxP = Math.floor(parr.length / PKT_STRIDE);
     let pc = 0;
+    const packed: VolumePacket[] = [];
     for (const p of sorted) {
       if (pc >= maxP) break;
       if (p.fade <= 0.01) continue;
@@ -742,19 +919,96 @@ export class VolumetricWorld {
       );
       parr[b + 3].set(p.albedoRgb[0], p.albedoRgb[1], p.albedoRgb[2], Math.min(p.ageSeconds, 20));
       parr[b + 4].set(p.velocity[0], p.velocity[1], p.velocity[2], p.seed % 17);
+      packed.push(p);
       pc++;
     }
     (pass.packetCount as any).value = pc;
+    this.binPacketsToTiles(packed, camera);
+  }
+
+  private static binScratch = { v: new THREE.Vector3() };
+
+  /**
+   * CPU screen-tile binning: each rendered packet's bounding sphere is
+   * projected to a half-res pixel rect and its index appended to every tile it
+   * touches (nearest-first, capped). The raymarch then evaluates only its
+   * tile's packets instead of the whole render list — the loop that used to be
+   * pixels × steps × ALL packets. A short global list of the optically
+   * heaviest packets serves the sun-shadow paths, which don't follow tiles.
+   */
+  private binPacketsToTiles(packed: VolumePacket[], camera: THREE.PerspectiveCamera): void {
+    const pass = this.pass;
+    const tiles = pass.tileData;
+    const tilesX = (pass.tilesX as any).value as number;
+    const tilesY = (pass.tilesY as any).value as number;
+    const tileCount = Math.min(tilesX * tilesY, MAX_TILES);
+    for (let t = 0; t < tileCount; t++) tiles[t * TILE_STRIDE] = 0;
+
+    const hw = (pass.halfSize.value as THREE.Vector2).x;
+    const hh = (pass.halfSize.value as THREE.Vector2).y;
+    const v = VolumetricWorld.binScratch.v;
+    const tanHalfFov = Math.tan((camera.fov * Math.PI) / 360);
+
+    const addToTile = (t: number, idx: number): void => {
+      const base = t * TILE_STRIDE;
+      const n = tiles[base];
+      if (n >= MAX_PER_TILE) return; // keep-nearest: list is distance-sorted
+      tiles[base + 1 + n] = idx;
+      tiles[base] = n + 1;
+    };
+
+    for (let idx = 0; idx < packed.length; idx++) {
+      const p = packed[idx];
+      const rad = Math.max(p.radii[0], p.radii[1], p.radii[2]) * 2.6;
+      v.set(p.position[0], p.position[1], p.position[2]);
+      const dist = v.distanceTo(camera.position);
+      if (dist <= rad) {
+        // Camera inside the bound: conservative splat to every tile.
+        for (let t = 0; t < tileCount; t++) addToTile(t, idx);
+        continue;
+      }
+      v.project(camera);
+      if (v.z > 1) continue; // fully behind
+      // NDC footprint of the bounding sphere.
+      const ry = rad / (dist * tanHalfFov);
+      const rx = ry / Math.max(camera.aspect, 1e-3);
+      const x0 = Math.max(0, Math.floor((((v.x - rx) * 0.5 + 0.5) * hw) / TILE_PX));
+      const x1 = Math.min(tilesX - 1, Math.floor((((v.x + rx) * 0.5 + 0.5) * hw) / TILE_PX));
+      const y0 = Math.max(0, Math.floor((((-v.y - ry) * 0.5 + 0.5) * hh) / TILE_PX));
+      const y1 = Math.min(tilesY - 1, Math.floor((((-v.y + ry) * 0.5 + 0.5) * hh) / TILE_PX));
+      for (let ty = y0; ty <= y1; ty++) {
+        for (let tx = x0; tx <= x1; tx++) {
+          addToTile(ty * tilesX + tx, idx);
+        }
+      }
+    }
+    pass.tileAttr.needsUpdate = true;
+
+    // Heaviest casters for the sun-shadow paths.
+    const byWeight = packed
+      .map((p, i) => ({ i, w: PacketSystem.peakSigmaT(p) * Math.max(...p.radii) }))
+      .sort((a, b) => b.w - a.w)
+      .slice(0, MAX_HEAVY);
+    const heavy = (pass.heavyIdx as any).array as number[] | Float32Array;
+    for (let j = 0; j < byWeight.length; j++) heavy[j] = byWeight[j].i;
+    (pass.heavyCount as any).value = byWeight.length;
   }
 
   private gpuTimingsPending = false;
   private resolveGpuTimings(): void {
-    if (!(this.renderer as any).trackTimestamp) return;
+    // In three r180 `trackTimestamp` lives on the BACKEND (narrowed by the
+    // timestamp-query feature check during init), not on the renderer — the
+    // old renderer-level guard was always undefined, so timings never resolved
+    // and the GPU-budget quality controller was flying blind on real GPUs.
+    if (!(this.renderer as any).backend?.trackTimestamp) return;
     if (this.gpuTimingsPending) return;
     this.gpuTimingsPending = true;
+    // Resolve BOTH pools every frame: each pool holds 2048 queries and this
+    // engine issues dozens of compute dispatches per island step, so an
+    // unresolved pool exhausts within seconds and timing silently stops.
     Promise.all([
-      (this.renderer as any).resolveTimestampsAsync?.('render'),
-      (this.renderer as any).resolveTimestampsAsync?.('compute'),
+      this.renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER),
+      this.renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE),
     ])
       .then(() => {
         const info: any = this.renderer.info;

@@ -23,6 +23,7 @@ export class Hud {
     detail: 0.75,
     exposure: 0.55,
     dustShadow: 0.85,
+    translucency: 0.35,
     debugDistance: false,
     paused: false,
   };
@@ -54,6 +55,9 @@ export class Hud {
     this.gui
       .add({ preset: presetName }, 'preset', Object.keys(PRESETS))
       .onChange((v: string) => this.reload({ preset: v }));
+    this.gui
+      .add(world.scheduler, 'focusMode', ['camera', 'events'])
+      .name('LOD focus');
     const cam = this.gui.addFolder('camera');
     if (cameraModes) {
       this.cameraModes = cameraModes;
@@ -78,6 +82,7 @@ export class Hud {
     look.add(c, 'detail', 0, 1.2, 0.05).onChange((v: number) => ((world.pass.detailStrength as { value: number }).value = v));
     look.add(c, 'exposure', 0.1, 1.6, 0.05).onChange((v: number) => ((world.pass.exposure as { value: number }).value = v));
     look.add(c, 'dustShadow', 0, 1, 0.05).onChange((v: number) => ((world.pass.dustShadowStrength as { value: number }).value = v));
+    look.add(c, 'translucency', 0.05, 1.0, 0.05).name('shadow density').onChange((v: number) => world.setTranslucency(v));
     look.add(c, 'debugDistance').onChange((v: boolean) => ((world.pass.debugMode as { value: number }).value = v ? 1 : 0));
     this.gui.add(c, 'paused');
     if (onDownloadReport) {
@@ -130,7 +135,7 @@ export class Hud {
         .activeIslands()
         .map(
           (i) =>
-            `  slot${i.slot} ${i.tier} ${i.rateHz}Hz ~${i.estimatedMassKg.toFixed(0)}kg imp=${i.importance.toFixed(3)}${i.retiring ? ' retiring' : ''}`,
+            `  slot${i.slot} ${i.tier} ${i.cls} ${this.world.engine.islands[i.slot].N}³ ${i.rateHz.toFixed(0)}Hz ~${i.estimatedMassKg.toFixed(0)}kg imp=${i.importance.toFixed(3)}${i.retiring ? ' retiring' : ''}${i.reboxing ? ' reboxing' : ''}`,
         )
         .join('\n');
       this.statsEl.textContent =

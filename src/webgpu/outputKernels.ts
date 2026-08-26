@@ -2,7 +2,7 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, int, uint, uvec3, vec3, vec4,
-  min, max, clamp, exp, sqrt, length, dot, smoothstep, mix,
+  min, max, clamp, exp, sqrt, log, length, dot, smoothstep, mix, floor, fract, sin,
   instanceIndex, textureStore, texture3D,
 } from 'three/tsl';
 import { GpuField, fieldCoord, fieldIndex } from './fields';
@@ -11,23 +11,64 @@ import type { IslandFields, ScratchFields } from './solverKernels';
 
 export const COARSE = 16;
 
+export type SlotClass = 'fine' | 'coarse';
+
+/** One pooled island slot in the shared 3D atlas. */
+export interface SlotDesc {
+  offsetVox: [number, number, number];
+  res: number;
+  cls: SlotClass;
+}
+
 export interface VolumeAtlas {
   texA: THREE.Storage3DTexture; // σt rgb, loading
   texB: THREE.Storage3DTexture; // albedo rgb, g encoded
   texVel: THREE.Storage3DTexture; // velocity xyz (m/s)
-  texShadow: THREE.Storage3DTexture; // sqrt(sun transmittance)
+  texShadow: THREE.Storage3DTexture; // sqrt(sun transmittance), 16-bit fixed point in (x=hi, y=lo/255)
   dimX: number;
   dimY: number;
   dimZ: number;
-  slotRes: number;
+  /** Finest slot resolution (the atlas Z extent). */
+  fineRes: number;
+  slots: SlotDesc[];
 }
 
-export function createAtlas(slotRes: number, slots: number): VolumeAtlas {
-  const sx = Math.min(slots, 2);
-  const sy = Math.ceil(slots / 2);
-  const dimX = slotRes * sx;
-  const dimY = slotRes * sy;
-  const dimZ = slotRes;
+/**
+ * Coarse-class resolution for a given fine resolution: roughly half, snapped
+ * to a multiple of the 16³ export grid (kDownsampleMass divisibility).
+ */
+export function coarseResFor(fineRes: number): number {
+  return Math.max(16, Math.round(fineRes / 2 / 16) * 16);
+}
+
+/**
+ * Mixed-resolution shelf-packed atlas: a row of fine slots (full slotRes),
+ * then a row of coarse slots at ~half resolution. Coarse islands cover the
+ * same world extents with 1/8 the voxels — the far-from-camera tier of the
+ * viewer-centric LOD.
+ */
+export function createAtlas(slotRes: number, classes: SlotClass[]): VolumeAtlas {
+  const N = slotRes;
+  const Nc = coarseResFor(N);
+  const fine = classes.filter((c) => c === 'fine').length;
+  const coarse = classes.length - fine;
+  const dimX = Math.max(fine * N, coarse * Nc, N);
+  const dimY = N + (coarse > 0 ? Nc : 0);
+  const dimZ = N;
+
+  const slots: SlotDesc[] = [];
+  let fx = 0;
+  let cx = 0;
+  for (const cls of classes) {
+    if (cls === 'fine') {
+      slots.push({ offsetVox: [fx, 0, 0], res: N, cls });
+      fx += N;
+    } else {
+      slots.push({ offsetVox: [cx, N, 0], res: Nc, cls });
+      cx += Nc;
+    }
+  }
+
   const make = (halfFloat: boolean, label: string) => {
     const t = new THREE.Storage3DTexture(dimX, dimY, dimZ);
     t.name = label;
@@ -47,13 +88,13 @@ export function createAtlas(slotRes: number, slots: number): VolumeAtlas {
     dimX,
     dimY,
     dimZ,
-    slotRes,
+    fineRes: N,
+    slots,
   };
 }
 
 export function slotOffsetVox(atlas: VolumeAtlas, slot: number): [number, number, number] {
-  const sx = Math.floor(atlas.dimX / atlas.slotRes);
-  return [(slot % sx) * atlas.slotRes, Math.floor(slot / sx) * atlas.slotRes, 0];
+  return atlas.slots[slot].offsetVox;
 }
 
 /**
@@ -82,10 +123,16 @@ export function initAtlasTextures(renderer: THREE.WebGPURenderer, atlas: VolumeA
   upload(atlas.texA, 8, () => {});
   upload(atlas.texVel, 8, () => {});
   upload(atlas.texB, 4, (b) => b.fill(0x80));
-  upload(atlas.texShadow, 4, (b) => b.fill(0xff));
+  // sqrt(T)=1 in 16-bit fixed point: hi=0xff, lo=0 (lo=0xff would decode >1).
+  upload(atlas.texShadow, 4, (b) => {
+    for (let i = 0; i < b.length; i += 4) {
+      b[i] = 0xff; b[i + 1] = 0; b[i + 2] = 0; b[i + 3] = 0xff;
+    }
+  });
 }
 
-const MAX_SIGMA_T = 250.0;
+/** Extinction soft-knee (1/m): sigma compresses toward this instead of clamping. */
+const SIGMA_KNEE = 70.0;
 
 /** Bake density moments + center velocity into the render atlas (with soft slot-edge fade). */
 export function kWriteVolume(f: IslandFields, s: ScratchFields, uni: IslandUniforms, atlas: VolumeAtlas): any {
@@ -97,15 +144,22 @@ export function kWriteVolume(f: IslandFields, s: ScratchFields, uni: IslandUnifo
       const a = f.dA.node.element(instanceIndex).toVar();
       const b = f.dB.node.element(instanceIndex).toVar();
 
-      // Soft 2-voxel fade at slot edges: keeps trilinear sampling from bleeding
-      // across atlas slots and gives islands soft open boundaries.
+      // World-space (~1.2 m) fade at slot edges: keeps trilinear sampling from
+      // bleeding across atlas slots and gives islands soft open boundaries. A
+      // fixed 2-voxel fade was ~0.2 m at fine tiers, which made a freshly
+      // filled island read as a hard white box.
       const ex = min(float(x), float(N - 1).sub(float(x)));
       const ey = min(float(y), float(N - 1).sub(float(y)));
       const ez = min(float(z), float(N - 1).sub(float(z)));
       const edge = min(ex, min(ey, ez)).add(0.5);
-      const fade = smoothstep(0.0, 2.0, edge);
+      const fadeVox = clamp(uni.invH.mul(1.2), 2.0, 12.0);
+      const fade = smoothstep(0.0, fadeVox, edge);
 
-      const sigma = clamp(a.xyz.mul(fade), vec3(0.0), vec3(MAX_SIGMA_T)).toVar();
+      // Soft-knee extinction: compress sigma_t so dense cores stay thick smoke
+      // instead of saturating into a solid surface (linear below the knee,
+      // asymptotic to it above — replaces the hard MAX_SIGMA_T clamp).
+      const sRaw = max(a.xyz.mul(fade), vec3(0.0));
+      const sigma = exp(sRaw.negate().div(SIGMA_KNEE)).oneMinus().mul(SIGMA_KNEE).toVar();
       const loading = max(a.w.mul(fade), 0.0);
       const albedo = clamp(b.xyz.div(max(a.xyz, vec3(1e-4))), vec3(0.0), vec3(1.0));
       const scatLum = dot(b.xyz, vec3(0.2126, 0.7152, 0.0722));
@@ -159,7 +213,7 @@ export function kLightMarch(f: IslandFields, uni: IslandUniforms, atlas: VolumeA
         const lc = clamp(local, vec3(0.002), vec3(0.998));
         const uvw = uni.slotOffsetVox.add(lc.mul(float(N))).div(atlasDims);
         const sig = texture3D(atlas.texA, uvw, int(0)).xyz;
-        od.addAssign(dot(sig, vec3(0.2126, 0.7152, 0.0722)).mul(stepLen));
+        od.addAssign(dot(sig, vec3(0.2126, 0.7152, 0.0722)).mul(stepLen).mul(uni.shadowDensity));
         If(od.greaterThan(9.0), () => {
           Break();
         });
@@ -170,7 +224,171 @@ export function kLightMarch(f: IslandFields, uni: IslandUniforms, atlas: VolumeA
         uint(y.add(int(uni.slotOffsetVox.y))),
         uint(z.add(int(uni.slotOffsetVox.z))),
       );
-      textureStore(atlas.texShadow, texel, vec4(sqrt(trans), 0.0, 0.0, 1.0)).toWriteOnly();
+      // 16-bit fixed-point sqrt(T) across two 8-bit channels (x=hi, y=lo):
+      // 8 bits alone band visibly on smooth domes. e = hi + lo/255 is linear,
+      // so hardware trilinear filtering reconstructs it exactly.
+      const enc = sqrt(trans).mul(255.0);
+      textureStore(atlas.texShadow, texel, vec4(floor(enc).div(255.0), fract(enc), 0.0, 1.0)).toWriteOnly();
+    });
+  })().compute(cells);
+}
+
+/**
+ * O(N³) directional light sweep replacing the O(N³·lightSteps) per-voxel
+ * march: one thread per launch column on a 2N×2N grid (covering worst-case
+ * 45° shear), each walking N layers along the dominant sun axis, accumulating
+ * optical depth once per layer and storing sqrt(T). Per-layer column drift is
+ * identical across threads, so each layer's writes are a shifted bijection of
+ * the launch grid — full coverage, no races, no barriers, and no per-voxel
+ * jitter speckle (a per-COLUMN entry jitter decorrelates banding instead).
+ */
+export function kLightSweep(f: IslandFields, uni: IslandUniforms, atlas: VolumeAtlas): any {
+  const N = f.N;
+  const W = 2 * N;
+  const threads = W * W;
+  const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(threads)), () => {
+      const idx = int(instanceIndex).toVar();
+      const tb = idx.div(int(W)).toVar();
+      const ta = idx.sub(tb.mul(int(W))).toVar();
+      const a0 = float(ta).add(uni.sweepBase.x).toVar();
+      const b0 = float(tb).add(uni.sweepBase.y).toVar();
+
+      const da = uni.sweepParams.x;
+      const db = uni.sweepParams.y;
+      const L0 = uni.sweepParams.z;
+      const dL = uni.sweepParams.w;
+      const stepOd = uni.sweepStepLen.mul(uni.shadowDensity).toVar();
+
+      // Per-column entry jitter breaks residual layer banding without the
+      // per-voxel speckle the old march produced.
+      const jit = fract(sin(float(ta).mul(127.1).add(float(tb).mul(311.7))).mul(43758.5453)).mul(0.5).toVar();
+
+      const od = float(0).toVar();
+      Loop({ start: int(0), end: int(N), type: 'int', condition: '<' }, ({ i }: any) => {
+        const fi = float(i).toVar();
+        const layer = L0.add(dL.mul(fi)).toVar();
+        // Continuous sample position (voxel space) along the true sun ray.
+        const ac = a0.add(da.mul(fi.add(jit))).add(0.5);
+        const bc = b0.add(db.mul(fi.add(jit))).add(0.5);
+        const vox = uni.sweepAxisA.mul(ac)
+          .add(uni.sweepAxisL.mul(layer.add(0.5)))
+          .add(uni.sweepAxisB.mul(bc)).toVar();
+        const local = vox.div(float(N)).toVar();
+        const inside = local.x.greaterThanEqual(0.0).and(local.y.greaterThanEqual(0.0)).and(local.z.greaterThanEqual(0.0))
+          .and(local.x.lessThan(1.0)).and(local.y.lessThan(1.0)).and(local.z.lessThan(1.0));
+
+        const sigLum = float(0).toVar();
+        If(inside.and(od.lessThan(14.0)), () => {
+          const lc = clamp(local, vec3(0.002), vec3(0.998));
+          const uvw = uni.slotOffsetVox.add(lc.mul(float(N))).div(atlasDims);
+          const sig = texture3D(atlas.texA, uvw, int(0)).xyz;
+          sigLum.assign(dot(sig, vec3(0.2126, 0.7152, 0.0722)));
+        });
+
+        // Half-step self attenuation: write T at the voxel centre.
+        od.addAssign(sigLum.mul(stepOd).mul(0.5));
+        // Quantized output column for this layer (same drift for all threads —
+        // a bijection of the launch grid, so every slot texel is written once).
+        const oa = a0.add(floor(da.mul(fi).add(0.5))).toVar();
+        const ob = b0.add(floor(db.mul(fi).add(0.5))).toVar();
+        const outVox = uni.sweepAxisA.mul(oa)
+          .add(uni.sweepAxisL.mul(layer))
+          .add(uni.sweepAxisB.mul(ob)).toVar();
+        const inRange = outVox.x.greaterThanEqual(0.0).and(outVox.y.greaterThanEqual(0.0)).and(outVox.z.greaterThanEqual(0.0))
+          .and(outVox.x.lessThan(float(N))).and(outVox.y.lessThan(float(N))).and(outVox.z.lessThan(float(N)));
+        If(inRange, () => {
+          const texel = uvec3(
+            uint(int(outVox.x).add(int(uni.slotOffsetVox.x))),
+            uint(int(outVox.y).add(int(uni.slotOffsetVox.y))),
+            uint(int(outVox.z).add(int(uni.slotOffsetVox.z))),
+          );
+          const enc = sqrt(exp(od.negate())).mul(255.0);
+          textureStore(atlas.texShadow, texel, vec4(floor(enc).div(255.0), fract(enc), 0.0, 1.0)).toWriteOnly();
+        });
+        od.addAssign(sigLum.mul(stepOd).mul(0.5));
+      });
+    });
+  })().compute(threads);
+}
+
+/**
+ * In-place re-tiering ("rebox"): initialize this island's density/optical
+ * fields by trilinearly sampling the OLD slot's atlas region. The decode is
+ * the exact inverse of kWriteVolume's encode (soft-knee extinction and slot
+ * edge fade divided out, clamped) so an upgrade/downgrade crossfade holds
+ * near-constant optical depth. Source slot is pure uniforms — one compiled
+ * kernel per island resamples from any slot.
+ */
+export function kReboxDensity(f: IslandFields, uni: IslandUniforms, atlas: VolumeAtlas): any {
+  const cells = f.dA.count;
+  const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(cells)), () => {
+      const { x, y, z } = fieldCoord(f.dA, instanceIndex);
+      const p = vec3(float(x).add(0.5), float(y).add(0.5), float(z).add(0.5)).mul(uni.h).add(uni.origin).toVar();
+      const srcLocal = p.sub(uni.reboxSrcOrigin).div(uni.reboxSrcSize).toVar();
+      const inside = srcLocal.x.greaterThanEqual(0.0).and(srcLocal.y.greaterThanEqual(0.0)).and(srcLocal.z.greaterThanEqual(0.0))
+        .and(srcLocal.x.lessThan(1.0)).and(srcLocal.y.lessThan(1.0)).and(srcLocal.z.lessThan(1.0));
+      const outA = vec4(0.0).toVar();
+      const outB = vec4(0.0).toVar();
+      If(inside, () => {
+        const lc = clamp(srcLocal, vec3(0.002), vec3(0.998));
+        const uvw = uni.reboxSrcOff.add(lc.mul(uni.reboxSrcRes)).div(atlasDims).toVar();
+        const a = texture3D(atlas.texA, uvw, int(0)).toVar();
+        const b = texture3D(atlas.texB, uvw, int(0)).toVar();
+        // Undo the OLD slot's edge fade (clamped: a downgrade must not inherit
+        // a density-dip ring at the old boundary).
+        const voxCoord = srcLocal.mul(uni.reboxSrcRes).toVar();
+        const edge = min(
+          min(voxCoord.x, uni.reboxSrcRes.sub(voxCoord.x)),
+          min(min(voxCoord.y, uni.reboxSrcRes.sub(voxCoord.y)), min(voxCoord.z, uni.reboxSrcRes.sub(voxCoord.z))),
+        );
+        const invHOld = uni.reboxSrcRes.div(uni.reboxSrcSize);
+        const fadeVox = clamp(invHOld.mul(1.2), 2.0, 12.0);
+        // The clamp bounds noise amplification, but every 1/clamp of head-room
+        // recovers real mass stored under the fade — 0.08 keeps ~all of the
+        // plume through repeated up/down reboxes.
+        const fade = max(smoothstep(0.0, fadeVox, edge), 0.08);
+        // Invert the soft knee back to raw extinction.
+        const sigKnee = min(a.xyz, vec3(SIGMA_KNEE * 0.98));
+        const sRaw = vec3(0.0).sub(vec3(SIGMA_KNEE).mul(sigKnee.div(SIGMA_KNEE).oneMinus().log())).div(fade).toVar();
+        const loading = a.w.div(fade);
+        const albedo = b.xyz;
+        const g = b.w.mul(2.0).sub(1.0);
+        const scat = albedo.mul(sRaw).toVar();
+        outA.assign(vec4(sRaw, loading));
+        outB.assign(vec4(scat, g.mul(dot(scat, vec3(0.2126, 0.7152, 0.0722)))));
+      });
+      f.dA.node.element(instanceIndex).assign(outA);
+      f.dB.node.element(instanceIndex).assign(outB);
+    });
+  })().compute(cells);
+}
+
+/** Rebox companion: initialize one MAC velocity component from the old slot's texVel. */
+export function kReboxVelocity(f: IslandFields, uni: IslandUniforms, atlas: VolumeAtlas, comp: 0 | 1 | 2): any {
+  const field = comp === 0 ? f.u : comp === 1 ? f.v : f.w;
+  const cells = field.count;
+  const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(cells)), () => {
+      const { x, y, z } = fieldCoord(field, instanceIndex);
+      // Face-center world position for this MAC component.
+      const off = comp === 0 ? vec3(0.0, 0.5, 0.5) : comp === 1 ? vec3(0.5, 0.0, 0.5) : vec3(0.5, 0.5, 0.0);
+      const p = vec3(float(x), float(y), float(z)).add(off).mul(uni.h).add(uni.origin).toVar();
+      const srcLocal = p.sub(uni.reboxSrcOrigin).div(uni.reboxSrcSize).toVar();
+      const inside = srcLocal.x.greaterThanEqual(0.0).and(srcLocal.y.greaterThanEqual(0.0)).and(srcLocal.z.greaterThanEqual(0.0))
+        .and(srcLocal.x.lessThan(1.0)).and(srcLocal.y.lessThan(1.0)).and(srcLocal.z.lessThan(1.0));
+      const vel = float(0.0).toVar();
+      If(inside, () => {
+        const lc = clamp(srcLocal, vec3(0.002), vec3(0.998));
+        const uvw = uni.reboxSrcOff.add(lc.mul(uni.reboxSrcRes)).div(atlasDims);
+        const v = texture3D(atlas.texVel, uvw, int(0)).xyz;
+        vel.assign(comp === 0 ? v.x : comp === 1 ? v.y : v.z);
+      });
+      field.node.element(instanceIndex).assign(vel);
     });
   })().compute(cells);
 }
@@ -190,7 +408,7 @@ export function kClearVolumeSlot(N: number, uni: IslandUniforms, atlas: VolumeAt
       textureStore(atlas.texA, texel, vec4(0.0)).toWriteOnly();
       textureStore(atlas.texB, texel, vec4(0.5)).toWriteOnly();
       textureStore(atlas.texVel, texel, vec4(0.0)).toWriteOnly();
-      textureStore(atlas.texShadow, texel, vec4(1.0)).toWriteOnly();
+      textureStore(atlas.texShadow, texel, vec4(1.0, 0.0, 0.0, 1.0)).toWriteOnly();
     });
   })().compute(cells);
 }
@@ -225,6 +443,44 @@ export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUn
         });
       });
       s.coarseMass.node.element(instanceIndex).assign(acc);
+    });
+  })().compute(coarseCells);
+}
+
+/**
+ * Mass-weighted momentum per coarse cell: (Σm·vx, Σm·vy, Σm·vz, Σm) with
+ * velocity averaged from the MAC faces. Read back with the mass grid so
+ * exported packets inherit the plume's actual outgoing velocity instead of
+ * ambient wind (the single biggest cause of "a dome appears out of nowhere
+ * and just sits there" at retirement).
+ */
+export function kDownsampleMomentum(f: IslandFields, s: ScratchFields, uni: IslandUniforms): any {
+  const N = f.N;
+  const block = N / COARSE;
+  const coarseCells = COARSE * COARSE * COARSE;
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(coarseCells)), () => {
+      const { x, y, z } = fieldCoord(s.coarseMom, instanceIndex);
+      const acc = vec4(0.0).toVar();
+      const cellVol = uni.h.mul(uni.h).mul(uni.h).toVar();
+      Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i }: any) => {
+        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: j }: any) => {
+          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: k }: any) => {
+            const cx = x.mul(int(block)).add(k).toVar();
+            const cy = y.mul(int(block)).add(j).toVar();
+            const cz = z.mul(int(block)).add(i).toVar();
+            const m = f.dA.node.element(fieldIndex(f.dA, cx, cy, cz)).w.mul(cellVol).toVar();
+            const vx = f.u.node.element(fieldIndex(f.u, cx, cy, cz))
+              .add(f.u.node.element(fieldIndex(f.u, cx.add(int(1)), cy, cz))).mul(0.5);
+            const vy = f.v.node.element(fieldIndex(f.v, cx, cy, cz))
+              .add(f.v.node.element(fieldIndex(f.v, cx, cy.add(int(1)), cz))).mul(0.5);
+            const vz = f.w.node.element(fieldIndex(f.w, cx, cy, cz))
+              .add(f.w.node.element(fieldIndex(f.w, cx, cy, cz.add(int(1))))).mul(0.5);
+            acc.addAssign(vec4(m.mul(vx), m.mul(vy), m.mul(vz), m));
+          });
+        });
+      });
+      s.coarseMom.node.element(instanceIndex).assign(acc);
     });
   })().compute(coarseCells);
 }

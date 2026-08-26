@@ -1,13 +1,20 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as THREE from 'three/webgpu';
 import {
-  Fn, If, Loop, Break, float, int, ivec2, vec2, vec3, vec4,
-  uniform, uniformArray, texture, texture3D, textureLoad, uv,
+  Fn, If, Loop, Break, array, float, int, ivec2, vec2, vec3, vec4,
+  uniform, uniformArray, texture, texture3D, textureLoad, uv, storage,
   min, max, clamp, exp, sqrt, pow, mix, smoothstep, normalize, length, dot, fract, floor, sin,
 } from 'three/tsl';
 import type { VolumeAtlas } from '../webgpu/outputKernels';
 
 export const MAX_ISLANDS = 4;
+/** Screen-tile packet culling: tile size in half-res pixels and list capacity. */
+export const TILE_PX = 24;
+export const MAX_TILES = 4096;
+export const MAX_PER_TILE = 16;
+export const TILE_STRIDE = MAX_PER_TILE + 1; // [count, idx0..idx15]
+/** Global shadow-caster list: the optically heaviest packets shadow everywhere. */
+export const MAX_HEAVY = 8;
 export const ISLE_STRIDE = 3; // m0 origin+size | m1 slotOffVox+active | m2 age+fade
 export const PKT_STRIDE = 5; // r0 pos+fade | r1 radii+phaseG | r2 ext0+detailScale | r3 albedo+age | r4 vel+seed
 
@@ -48,7 +55,6 @@ export class VolumetricPass {
   exposure = uniform(0.62);
   raySteps = uniform(64);
   detailStrength = uniform(0.75);
-  detailScale = uniform(1.4);
   timeS = uniform(0);
   frameIdx = uniform(0);
   historyBlend = uniform(0.82);
@@ -56,12 +62,25 @@ export class VolumetricPass {
   fullSize = uniform(new THREE.Vector2(1, 1));
   halfSize = uniform(new THREE.Vector2(1, 1));
   dustShadowStrength = uniform(0.85);
+  /** Extinction multiplier for self-shadowing only (film translucency trick). */
+  shadowDensity = uniform(0.35);
   debugMode = uniform(0); // 0 off | 1 opaque distance | 2 density slice | 3 shadow slice
 
   islandCount = uniform(0);
   islandMeta = uniformArray(v4arr(MAX_ISLANDS * ISLE_STRIDE));
   packetCount = uniform(0);
   packets: any;
+
+  // Per-screen-tile packet index lists (CPU-binned each frame) so a ray only
+  // evaluates the packets that can touch its pixel, plus a tiny global list of
+  // the heaviest packets used for sun shadows (a caster can be off-tile).
+  tileData = new Uint32Array(MAX_TILES * TILE_STRIDE);
+  tileAttr: THREE.StorageBufferAttribute;
+  private tileNode: any;
+  tilesX = uniform(1);
+  tilesY = uniform(1);
+  heavyIdx = uniformArray(new Array(MAX_HEAVY).fill(0));
+  heavyCount = uniform(0);
 
   private raymarchMat: THREE.NodeMaterial;
   private compositeMat: THREE.NodeMaterial;
@@ -84,6 +103,10 @@ export class VolumetricPass {
       this.buildLevel = Number(new URLSearchParams(location.search).get('mlevel') ?? 0);
     }
     this.packets = uniformArray(v4arr(opts.maxRenderPackets * PKT_STRIDE));
+    this.tileAttr = new THREE.StorageBufferAttribute(this.tileData, 1);
+    this.tileAttr.name = 'packetTiles';
+    (this.tileAttr as any).usage = THREE.DynamicDrawUsage;
+    this.tileNode = storage(this.tileAttr, 'uint', this.tileData.length);
 
     const w = 8, h = 8; // resized on first setSize
     this.sceneRT = new THREE.RenderTarget(w, h, { type: THREE.HalfFloatType });
@@ -127,6 +150,8 @@ export class VolumetricPass {
     this.histRT[1].setSize(hw, hh);
     (this.fullSize.value as THREE.Vector2).set(w, h);
     (this.halfSize.value as THREE.Vector2).set(hw, hh);
+    (this.tilesX as any).value = Math.max(1, Math.ceil(hw / TILE_PX));
+    (this.tilesY as any).value = Math.max(1, Math.ceil(hh / TILE_PX));
     this.outRT?.setSize(w, h);
   }
 
@@ -235,10 +260,28 @@ export class VolumetricPass {
     return n1.add(n2).mul(0.666); // ≈ [-1, 1]
   }
 
+  /**
+   * Shared sub-grid detail modulation for BOTH islands and packets: the same
+   * fbm response and the same σt-driven edge erosion, so a plume keeps an
+   * identical surface texture across the grid↔packet handoff.
+   */
+  private detailModulate(n01: any, sigLum: any) {
+    // Smoothstep-shaped response: the raw fbm value produces binary
+    // cauliflower lumps; easing it keeps billow structure but soft flanks.
+    const nS = n01.mul(n01).mul(n01.mul(-2.0).add(3.0));
+    const edge = smoothstep(1.2, 0.05, sigLum);
+    return clamp(
+      nS.mul(this.detailStrength).mul(1.5)
+        .add(float(1.0).sub(this.detailStrength.mul(0.6)))
+        .sub(edge.mul(this.detailStrength).mul(nS.oneMinus()).mul(0.9)),
+      0.0,
+      1.9,
+    );
+  }
+
   private buildRaymarch(temporal: boolean): any {
     const atlas = this.atlas;
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
-    const N = float(atlas.slotRes);
 
     if (this.buildLevel >= 3) {
       return Fn(() => vec4(0.0, 0.0, 0.0, 1.0))();
@@ -254,7 +297,21 @@ export class VolumetricPass {
       const farWorld = this.camWorld.mul(vec4(vpFar.xyz.div(vpFar.w), 1.0)).xyz;
       const rayDir = normalize(farWorld.sub(this.camPos)).toVar();
 
-      // Union of ray intervals over island AABBs + packet bounds.
+      // Per-volume ray segments instead of one union interval: a single
+      // [min, max] over all volumes marched the empty gaps between them, so a
+      // distant cloud stole samples from a near one. Up to 4 island segments
+      // plus one packet-cluster segment; sorted, overlap-clipped, and given
+      // steps proportional to length with a near-field bias.
+      // This pixel's packet tile (count + indices into the packet array).
+      const pixT = uvN.mul(this.halfSize).toVar();
+      const tX = clamp(int(pixT.x.div(TILE_PX)), int(0), int(this.tilesX).sub(int(1))).toVar();
+      const tY = clamp(int(pixT.y.div(TILE_PX)), int(0), int(this.tilesY).sub(int(1))).toVar();
+      const tileBase = tY.mul(int(this.tilesX)).add(tX).mul(int(TILE_STRIDE)).toVar();
+      const tileCnt = int(this.tileNode.element(tileBase)).toVar();
+
+      const segs = array('vec4', 5).toVar();
+      for (let s = 0; s < 5; s++) segs.element(int(s)).assign(vec4(1e9, 1e9, 0.0, 0.0));
+      const segCount = int(0).toVar();
       const tEnter = float(1e9).toVar();
       const tExit = float(0).toVar();
       const anyVolume = float(0).toVar();
@@ -272,39 +329,99 @@ export class VolumetricPass {
           const near = max(max(tsm.x, tsm.y), tsm.z).toVar();
           const far = min(min(tbg.x, tbg.y), tbg.z).toVar();
           If(far.greaterThan(max(near, 0.0)), () => {
+            segs.element(segCount).assign(vec4(max(near, 0.02), far, 0.0, 0.0));
+            segCount.addAssign(1);
             tEnter.assign(min(tEnter, max(near, 0.02)));
             tExit.assign(max(tExit, far));
             anyVolume.assign(1.0);
           });
         });
       }
-      const pcnt = int(this.packetCount).toVar();
-      if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
-        const base = i.mul(int(PKT_STRIDE));
-        const r0 = this.packets.element(base);
-        const r1 = this.packets.element(base.add(int(1)));
-        const rad = max(max(r1.x, r1.y), r1.z).mul(2.6).toVar();
-        const oc = r0.xyz.sub(this.camPos).toVar();
-        const tMid = dot(oc, rayDir).toVar();
-        const dPerp2 = dot(oc, oc).sub(tMid.mul(tMid)).toVar();
-        If(dPerp2.lessThan(rad.mul(rad)), () => {
-          const half = sqrt(max(rad.mul(rad).sub(dPerp2), 0.0));
-          const near = max(tMid.sub(half), 0.02);
-          const far = tMid.add(half);
-          If(far.greaterThan(near), () => {
-            tEnter.assign(min(tEnter, near));
-            tExit.assign(max(tExit, far));
-            anyVolume.assign(1.0);
+      if (this.buildLevel < 1) {
+        // The tile's packets contribute ONE cluster segment (interval union).
+        const pNear = float(1e9).toVar();
+        const pFar = float(0).toVar();
+        Loop({ start: int(0), end: tileCnt, type: 'int', condition: '<' }, ({ i }: any) => {
+          const base = int(this.tileNode.element(tileBase.add(i).add(int(1)))).mul(int(PKT_STRIDE));
+          const r0 = this.packets.element(base);
+          const r1 = this.packets.element(base.add(int(1)));
+          const rad = max(max(r1.x, r1.y), r1.z).mul(2.6).toVar();
+          const oc = r0.xyz.sub(this.camPos).toVar();
+          const tMid = dot(oc, rayDir).toVar();
+          const dPerp2 = dot(oc, oc).sub(tMid.mul(tMid)).toVar();
+          If(dPerp2.lessThan(rad.mul(rad)), () => {
+            const half = sqrt(max(rad.mul(rad).sub(dPerp2), 0.0));
+            const near = max(tMid.sub(half), 0.02);
+            const far = tMid.add(half);
+            If(far.greaterThan(near), () => {
+              pNear.assign(min(pNear, near));
+              pFar.assign(max(pFar, far));
+            });
           });
         });
-      });
+        If(pFar.greaterThan(pNear), () => {
+          segs.element(segCount).assign(vec4(pNear, pFar, 0.0, 0.0));
+          segCount.addAssign(1);
+          tEnter.assign(min(tEnter, pNear));
+          tExit.assign(max(tExit, pFar));
+          anyVolume.assign(1.0);
+        });
+      }
 
       const outCol = vec4(0.0, 0.0, 0.0, 1.0).toVar();
 
       If(anyVolume.greaterThan(0.5).and(tEnter.lessThan(opaqueDist)), () => {
         tExit.assign(min(tExit, opaqueDist));
-        const steps = int(this.raySteps).toVar();
-        const ds = tExit.sub(tEnter).div(float(steps)).toVar();
+
+        // Sort segments by near (bubble network, constant indices; the 1e9
+        // sentinels sink inactive entries to the end).
+        for (let a = 0; a < 4; a++) {
+          for (let b = 0; b < 4 - a; b++) {
+            const lo = segs.element(int(b));
+            const hi = segs.element(int(b + 1));
+            If(hi.x.lessThan(lo.x), () => {
+              const tmp = vec4(lo).toVar();
+              lo.assign(hi);
+              hi.assign(tmp);
+            });
+          }
+        }
+        // Clip overlaps into a disjoint piecewise union, bounded by opaque
+        // geometry, then allocate steps: proportional to length with a
+        // near-field bias so a huge far span can't starve a nearby cloud.
+        const prevFar = float(0.0).toVar();
+        const wSum = float(0.0).toVar();
+        for (let k = 0; k < 5; k++) {
+          const sg = segs.element(int(k));
+          If(sg.x.lessThan(1e8), () => {
+            sg.x.assign(max(sg.x, prevFar));
+            sg.y.assign(min(sg.y, opaqueDist));
+            prevFar.assign(max(prevFar, sg.y));
+            const len = max(sg.y.sub(sg.x), 0.0);
+            sg.z.assign(len.div(sg.x.div(25.0).add(1.0))); // weight
+            wSum.addAssign(sg.z);
+          }).Else(() => {
+            sg.z.assign(0.0);
+          });
+        }
+        // segMeta per segment: (near, ds, cumulativeStepStart, 0).
+        const segMeta = array('vec4', 5).toVar();
+        const cAcc = float(0.0).toVar();
+        for (let k = 0; k < 5; k++) {
+          const sg = segs.element(int(k));
+          const len = max(sg.y.sub(sg.x), 0.0).toVar();
+          const stepsK = float(0.0).toVar();
+          If(len.greaterThan(1e-4).and(wSum.greaterThan(1e-6)), () => {
+            stepsK.assign(clamp(
+              floor(this.raySteps.mul(sg.z.div(wSum)).add(0.5)),
+              4.0,
+              this.raySteps.mul(0.75),
+            ));
+          });
+          segMeta.element(int(k)).assign(vec4(sg.x, len.div(max(stepsK, 1.0)), cAcc, 0.0));
+          cAcc.addAssign(stepsK);
+        }
+        const steps = int(cAcc).toVar();
 
         // Interleaved-gradient jitter, animated per frame for temporal accumulation.
         const pix = uvN.mul(this.halfSize).toVar();
@@ -322,7 +439,19 @@ export class VolumetricPass {
         const dbgInside = float(0).toVar();
 
         Loop({ start: int(0), end: steps, type: 'int', condition: '<' }, ({ i }: any) => {
-          const t = tEnter.add(ds.mul(float(i).add(ign))).toVar();
+          // Map the global step index to its segment via the cumulative step
+          // starts (ascending; empty segments have zero width so the later
+          // assign wins and they are skipped).
+          const fi = float(i).toVar();
+          const segIdx = int(0).toVar();
+          for (let k = 1; k < 5; k++) {
+            If(fi.greaterThanEqual(segMeta.element(int(k)).z), () => {
+              segIdx.assign(k);
+            });
+          }
+          const sm = segMeta.element(segIdx).toVar();
+          const ds = sm.y.toVar();
+          const t = sm.x.add(ds.mul(fi.sub(sm.z).add(ign))).toVar();
           const p = this.camPos.add(rayDir.mul(t)).toVar();
 
           const sigT = vec3(0.0).toVar();
@@ -340,13 +469,14 @@ export class VolumetricPass {
               const inside = local.x.greaterThan(0.0).and(local.y.greaterThan(0.0)).and(local.z.greaterThan(0.0))
                 .and(local.x.lessThan(1.0)).and(local.y.lessThan(1.0)).and(local.z.lessThan(1.0));
               If(inside, () => {
-                const uvw0 = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(N)).div(atlasDims).toVar();
+                const slotN = m2.z; // per-island slot resolution (mixed-res pool)
+                const uvw0 = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(slotN)).div(atlasDims).toVar();
                 // Advective interpolation between low-rate sim steps:
                 // sample where this parcel was at the last field commit.
                 const vel = texture3D(atlas.texVel, uvw0, int(0)).xyz;
                 const p2 = p.sub(vel.mul(m2.x)).toVar();
                 const local2 = clamp(p2.sub(m0.xyz).div(m0.w), vec3(0.002), vec3(0.998)).toVar();
-                const uvw = m1.xyz.add(local2.mul(N)).div(atlasDims).toVar();
+                const uvw = m1.xyz.add(local2.mul(slotN)).div(atlasDims).toVar();
                 const a = texture3D(atlas.texA, uvw, int(0)).toVar();
                 dbgMaxLoad.assign(max(dbgMaxLoad, a.w));
                 dbgInside.addAssign(1.0);
@@ -356,23 +486,21 @@ export class VolumetricPass {
                   // (skipped entirely when detail is disabled — software adapters).
                   const m = float(1.0).toVar();
                   If(this.detailStrength.greaterThan(0.01), () => {
-                    const nPos = p2.div(this.detailScale).add(vec3(float(s).mul(7.31))).toVar();
+                    // World-space noise at the material's detail scale (m2.w),
+                    // with NO per-slot phase offset — the offset guaranteed a
+                    // visible texture jump at every retire/promote handoff and
+                    // across island boundaries.
+                    const nPos = p2.div(max(m2.w, 0.3)).toVar();
                     const n01 = this.fbm(nPos).mul(0.5).add(0.5).toVar();
                     const sLum0 = dot(a.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
-                    const edge = smoothstep(1.2, 0.05, sLum0).toVar();
-                    m.assign(clamp(
-                      n01.mul(this.detailStrength).mul(1.9)
-                        .add(float(1.0).sub(this.detailStrength.mul(0.75)))
-                        .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
-                      0.0,
-                      2.2,
-                    ));
+                    m.assign(this.detailModulate(n01, sLum0));
                   });
                   const st = a.xyz.mul(m).mul(m2.y).toVar();
                   sigT.addAssign(st);
                   sigS.addAssign(st.mul(b.xyz));
                   gW.addAssign(b.w.mul(2.0).sub(1.0).mul(dot(st.mul(b.xyz), vec3(0.2126, 0.7152, 0.0722))));
-                  const sh = texture3D(atlas.texShadow, uvw0, int(0)).x;
+                  const shTex = texture3D(atlas.texShadow, uvw0, int(0));
+                  const sh = min(shTex.x.add(shTex.y.div(255.0)), 1.0); // 16-bit sqrt(T)
                   sunTrans.mulAssign(sh.mul(sh));
                 });
               });
@@ -380,8 +508,8 @@ export class VolumetricPass {
           }
 
           // --- far-field volume packets (analytic anisotropic Gaussians) ---
-          if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i: j }: any) => {
-            const base = j.mul(int(PKT_STRIDE));
+          if (this.buildLevel < 1) Loop({ start: int(0), end: tileCnt, type: 'int', condition: '<' }, ({ i: j }: any) => {
+            const base = int(this.tileNode.element(tileBase.add(j).add(int(1)))).mul(int(PKT_STRIDE));
             const r0 = this.packets.element(base).toVar();
             const r1 = this.packets.element(base.add(int(1))).toVar();
             const rel = p.sub(r0.xyz).div(max(r1.xyz, vec3(1e-3))).toVar();
@@ -393,23 +521,33 @@ export class VolumetricPass {
               const gaus = exp(q.mul(-0.5)).mul(r0.w).toVar();
               const m = float(1.0).toVar();
               If(this.detailStrength.greaterThan(0.01), () => {
-                const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).add(r4.w).toVar();
+                // Same world-space noise field as islands (no per-packet seed):
+                // at spawn (age 0) this equals the island path's advected
+                // position, so the texture is continuous through a handoff and
+                // between neighbouring packets, then advects with the packet.
+                const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).toVar();
                 const n01 = this.fbm(pd).mul(0.5).add(0.5);
-                m.assign(clamp(
-                  n01.mul(this.detailStrength).mul(1.7).add(float(1.0).sub(this.detailStrength.mul(0.7)))
-                    .sub(smoothstep(0.6, 0.05, gaus.mul(dot(r2.xyz, vec3(1.0)))).mul(this.detailStrength).mul(n01.oneMinus())),
-                  0.0,
-                  2.0,
-                ));
+                const sigLum = gaus.mul(dot(r2.xyz, vec3(0.2126, 0.7152, 0.0722)));
+                m.assign(this.detailModulate(n01, sigLum));
               });
               const st = r2.xyz.mul(gaus).mul(m).toVar();
               sigT.addAssign(st);
               sigS.addAssign(st.mul(r3.xyz));
               gW.addAssign(r1.w.mul(dot(st.mul(r3.xyz), vec3(0.2126, 0.7152, 0.0722))));
-              // Cheap self-shadow toward the sun.
-              const od = this.packetRayOD(base, p, this.sunDir);
-              sunTrans.mulAssign(exp(od.negate().mul(0.8)));
             });
+
+          // Packet sun shadows from the global heavy list: a caster can sit in
+          // another tile entirely (sun rays don't follow screen tiles), and
+          // the heaviest few packets dominate the occlusion anyway.
+          if (this.buildLevel < 1) {
+            for (let jj = 0; jj < MAX_HEAVY; jj++) {
+              If(int(jj).lessThan(int(this.heavyCount)), () => {
+                const hb = int(this.heavyIdx.element(int(jj))).mul(int(PKT_STRIDE));
+                const od = this.packetRayOD(hb, p, this.sunDir);
+                sunTrans.mulAssign(exp(od.negate().mul(this.shadowDensity.mul(2.3))));
+              });
+            }
+          }
           });
 
           dbgAcc.addAssign(dot(sigT, vec3(1.0)).mul(ds));
@@ -431,7 +569,7 @@ export class VolumetricPass {
             const octB = [1.0, 0.62, 0.38];
             const octC = [1.0, 0.5, 0.25];
             for (let o = 0; o < 3; o++) {
-              const ph = this.hg(cosT, g.mul(octB[o])).mul(0.85).add(this.hg(cosT, float(-0.22)).mul(0.15));
+              const ph = this.hg(cosT, g.mul(octB[o])).mul(0.75).add(this.hg(cosT, float(-0.22)).mul(0.25));
               sun.addAssign(
                 this.sunColor.mul(this.sunIntensity)
                   .mul(ph)
@@ -442,10 +580,10 @@ export class VolumetricPass {
             sun.mulAssign(powder);
             // Height-graded ambient: near the ground the cloud is lit mostly by
             // warm ground bounce; higher up the cool sky dome dominates.
-            const ambOcc = mix(0.42, 1.0, sunT).toVar();
+            const ambOcc = mix(0.55, 1.0, sunT).toVar();
             const hFac = clamp(p.y.mul(0.09), 0.0, 1.0).toVar();
-            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.0796).mul(ambOcc).mul(mix(0.55, 1.0, hFac))
-              .add(this.groundBounce.mul(0.0398).mul(ambOcc).mul(mix(1.45, 0.35, hFac)));
+            const ambient = this.skyColor.mul(this.skyIntensity).mul(0.108).mul(ambOcc).mul(mix(0.6, 1.0, hFac))
+              .add(this.groundBounce.mul(0.054).mul(ambOcc).mul(mix(1.45, 0.35, hFac)));
 
             const S = sigS.mul(sun.add(ambient)).toVar();
             // Very-low-frequency warm/cool hue drift so large plumes don't read
@@ -526,10 +664,10 @@ export class VolumetricPass {
         const a6 = texture3D(atlas.texA, vec3(uvN.x, uvN.y, 0.5), int(0));
         outCol.assign(vec4(clamp(a6.xyz.mul(0.05), vec3(0.0), vec3(1.0)).add(vec3(a6.w.mul(0.2), 0.0, 0.0)), 1.0));
       });
-      // Debug: march interval diagnostics (r=hit, g=tEnter/100, b=span/30).
+      // Debug: march interval diagnostics (r=segments/5, g=tEnter/100, b=span/30).
       If(this.debugMode.equal(4), () => {
         outCol.assign(vec4(
-          anyVolume,
+          float(segCount).div(5.0),
           clamp(tEnter.div(100.0), 0.0, 1.0),
           clamp(tExit.sub(tEnter).div(30.0), 0.0, 1.0),
           1.0,
@@ -543,34 +681,61 @@ export class VolumetricPass {
   private buildComposite(): any {
     const atlas = this.atlas;
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
-    const N = float(atlas.slotRes);
     return Fn(() => {
       const uvN = uv().toVar();
       const scene = this.sceneTexNode.sample(uvN).toVar();
-      const vol = this.volTexNode.sample(uvN).toVar();
       const { world } = this.reconstruct(uvN);
+
+      // Depth-aware upsample of the half-res volume: plain bilinear bleeds the
+      // volume across opaque silhouettes (blocky halos on building edges).
+      // Weight the four surrounding half-res texels by how close their opaque
+      // distance is to this pixel's — neighbours across a depth edge drop out.
+      const dCenter = length(world.sub(this.camPos)).toVar();
+      const halfTexel = vec2(1.0).div(this.halfSize).toVar();
+      const volAcc = vec4(0.0).toVar();
+      const wAcc = float(0.0).toVar();
+      const offs = [
+        [-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5],
+      ];
+      for (const [ox, oy] of offs) {
+        const uvI = clamp(uvN.add(halfTexel.mul(vec2(ox, oy))), vec2(0.001), vec2(0.999)).toVar();
+        const { world: worldI } = this.reconstruct(uvI);
+        const dI = length(worldI.sub(this.camPos));
+        const w = float(1.0).div(dI.sub(dCenter).abs().div(max(dCenter, 1.0)).mul(24.0).add(0.05)).toVar();
+        volAcc.addAssign(this.volTexNode.sample(uvI).mul(w));
+        wAcc.addAssign(w);
+      }
+      const vol = volAcc.div(max(wAcc, 1e-4)).toVar();
 
       // Dust shadows cast onto the opaque world (sun transmittance caches + packets).
       const shadowF = float(1).toVar();
       for (let s = 0; s < (this.buildLevel < 2 ? MAX_ISLANDS : 0); s++) {
         const m0 = this.islandMeta.element(int(s * ISLE_STRIDE));
         const m1 = this.islandMeta.element(int(s * ISLE_STRIDE + 1));
+        const m2 = this.islandMeta.element(int(s * ISLE_STRIDE + 2));
         If(m1.w.greaterThan(0.5), () => {
           const local = world.sub(m0.xyz).div(m0.w).toVar();
           const inside = local.x.greaterThan(-0.02).and(local.y.greaterThan(-0.02)).and(local.z.greaterThan(-0.02))
             .and(local.x.lessThan(1.02)).and(local.y.lessThan(1.02)).and(local.z.lessThan(1.02));
           If(inside, () => {
-            const uvw = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(N)).div(atlasDims);
-            const sh = texture3D(atlas.texShadow, uvw, int(0)).x;
+            const uvw = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(m2.z)).div(atlasDims);
+            const shTex = texture3D(atlas.texShadow, uvw, int(0));
+            const sh = min(shTex.x.add(shTex.y.div(255.0)), 1.0); // 16-bit sqrt(T)
             shadowF.mulAssign(sh.mul(sh));
           });
         });
       }
-      const pcnt = int(this.packetCount).toVar();
-      if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
-        const od = this.packetRayOD(i.mul(int(PKT_STRIDE)), world, this.sunDir);
-        shadowF.mulAssign(exp(od.negate().mul(0.7)));
-      });
+      // Ground shadows from the global heavy-packet list (sun rays don't
+      // follow screen tiles, so the tile list can't be used for occlusion).
+      if (this.buildLevel < 1) {
+        for (let jj = 0; jj < MAX_HEAVY; jj++) {
+          If(int(jj).lessThan(int(this.heavyCount)), () => {
+            const hb = int(this.heavyIdx.element(int(jj))).mul(int(PKT_STRIDE));
+            const od = this.packetRayOD(hb, world, this.sunDir);
+            shadowF.mulAssign(exp(od.negate().mul(0.7)));
+          });
+        }
+      }
       const shaded = scene.xyz.mul(mix(1.0, shadowF, this.dustShadowStrength)).toVar();
 
       const hdr = shaded.mul(vol.w).add(vol.xyz).toVar();

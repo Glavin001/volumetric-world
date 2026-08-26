@@ -19,6 +19,7 @@ const SHOTS = [
   { scene: 'inside', steps: 44 },
   { scene: 'multi', steps: 78 },
   { scene: 'cityblock', steps: 175 },
+  { scene: 'avenue', steps: 200 },
 ];
 
 mkdirSync('docs/screenshots', { recursive: true });

@@ -301,6 +301,55 @@ export const SCENES: SceneDef[] = [
     },
   },
   {
+    id: 'avenue',
+    title: '300 m avenue (viewer-centric LOD)',
+    what: 'Fidelity follows the viewer: staggered collapses along a 300 m street — near dust simulates on fine grids, far dust on coarse grids or packets, re-tiering in place as you move (watch class/res in the stats panel; try first-person F).',
+    setup(ctx) {
+      lookAt(ctx, [-168, 24, 46], [-95, 3, 0]);
+      setSunAngles(ctx.env, 38, 105);
+      ctx.world.setWind([1.8, 0, 0.3]);
+      const buildings: Building[] = [];
+      // Two rows of blocks flanking a straight avenue along x.
+      for (let i = 0; i < 10; i++) {
+        const x = -135 + i * 30;
+        for (const side of [-1, 1]) {
+          buildings.push(addBuilding(
+            ctx.env,
+            [x, 3.2 + ((i + side + 11) % 3), side * 13],
+            [6, 6 + ((i * 2 + side + 7) % 5), 5],
+            side > 0 ? 0x9a8d7d : 0x8d8779,
+          ));
+        }
+      }
+      ctx.state.buildings = buildings;
+      // A car drives the avenue, stirring whatever it passes through.
+      const car = makeCar(ctx.env, [-150, 0, 2]);
+      ctx.state.car = car;
+      ctx.state.collapsed = [] as number[];
+    },
+    tick(ctx, _dt, t) {
+      const buildings = ctx.state.buildings as Building[];
+      const collapsed = ctx.state.collapsed as number[];
+      // Staggered collapses spread along the whole avenue.
+      const schedule: [number, number, number][] = [
+        [0.4, 1, 240], [2.2, 6, 260], [4.0, 11, 230], [5.8, 16, 250], [7.6, 9, 220],
+      ];
+      for (let k = 0; k < schedule.length; k++) {
+        const [when, idx, mass] = schedule[k];
+        if (t > when && !collapsed.includes(k) && buildings[idx]) {
+          collapseBuilding(ctx.env, buildings[idx], mass, 40 + k * 7);
+          collapsed.push(k);
+        }
+      }
+      // The car cruises the avenue at ~14 m/s and loops.
+      const car = ctx.state.car as KinematicBody;
+      const x = -150 + ((t * 14) % 310);
+      car.velocity.set(14, 0, 0);
+      car.position.set(x, 0, 2);
+      car.push(ctx.world, ctx.world.simTime);
+    },
+  },
+  {
     id: 'cityblock',
     title: 'City-block persistence',
     what: 'Grid→packet handoff: retiring islands become drifting anisotropic volume packets in the wind.',

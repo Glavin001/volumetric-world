@@ -13,12 +13,16 @@ import { clamp, dot, len, norm, sub } from './math';
 export interface IslandStateInit {
   center: Vec3;
   tier: IslandTier;
-  reason: 'event' | 'promotion';
+  reason: 'event' | 'promotion' | 'rebox';
+  /** Preferred resolution class; the pool falls back to the other class when full. */
+  cls?: 'fine' | 'coarse';
 }
 
 export interface IslandState {
   slot: number;
   active: boolean;
+  /** Fixed resolution class of this slot (mixed-res pool). */
+  cls: 'fine' | 'coarse';
   tier: IslandTier;
   sizeM: number;
   origin: [number, number, number];
@@ -42,6 +46,10 @@ export interface IslandState {
   /** Render crossfade 0..1 (used during packet handoff). */
   renderFade: number;
   retiring: boolean;
+  /** True while this island is being resampled into another slot (frozen). */
+  reboxing: boolean;
+  /** simTime since the island's class stopped matching its camera-relative need. */
+  classMismatchSince: number;
   /** Step counter for cadenced work (light cache, exports, metrics). */
   stepCount: number;
 }
@@ -60,6 +68,12 @@ export class IslandScheduler {
   readonly islands: IslandState[] = [];
   readonly preset: QualityPreset;
   gpuBudgetMs: number;
+  /**
+   * What fidelity follows: 'camera' allocates fine slots and high rates to
+   * islands near the viewer (the viewer always sees the best quality);
+   * 'events' gives every island the best free slot regardless of the camera.
+   */
+  focusMode: 'camera' | 'events' = 'camera';
   /** Global quality scalar the budget controller steers (0.4 .. 1.15). */
   qualityScale = 1;
   private gpuMsEma = 0;
@@ -71,6 +85,7 @@ export class IslandScheduler {
       this.islands.push({
         slot: s,
         active: false,
+        cls: opts.preset.slotClasses[s] ?? 'fine',
         tier: 'small',
         sizeM: opts.preset.tierSizeM.small,
         origin: [0, 0, 0],
@@ -90,6 +105,8 @@ export class IslandScheduler {
         focus: [0, 0, 0],
         renderFade: 1,
         retiring: false,
+        reboxing: false,
+        classMismatchSince: Infinity,
         stepCount: 0,
       });
     }
@@ -118,7 +135,10 @@ export class IslandScheduler {
    * spawning far-field packets directly).
    */
   allocate(init: IslandStateInit, now: number, camera: CameraInfo): IslandState | undefined {
-    let slot = this.islands.find((i) => !i.active);
+    const wanted = init.cls ?? this.classFor(init.center, camera);
+    let slot = this.islands.find((i) => !i.active && i.cls === wanted)
+      ?? this.islands.find((i) => !i.active);
+    if (init.reason === 'rebox' && slot && slot.cls !== wanted) return undefined;
     if (!slot) {
       const candidateImportance = this.scoreHypothetical(init.center, camera, now);
       let worst: IslandState | undefined;
@@ -137,7 +157,9 @@ export class IslandScheduler {
     slot.sizeM = sizeM;
     slot.center = [...init.center] as [number, number, number];
     slot.origin = [init.center[0] - sizeM / 2, init.center[1] - sizeM / 2, init.center[2] - sizeM / 2];
-    slot.rateHz = this.preset.tierRateHz[init.tier];
+    // Coarse (far-from-camera) islands also step slower: 1/8 the cells AND
+    // a reduced rate — the render-side advective interpolation hides it.
+    slot.rateHz = this.preset.tierRateHz[init.tier] * (slot.cls === 'coarse' ? 0.6 : 1);
     // Stagger: offset each slot's phase so islands do not step on the same frame.
     slot.nextStepAt = now + (slot.slot * 0.618) % (1 / slot.rateHz);
     slot.lastStepAt = now;
@@ -153,13 +175,24 @@ export class IslandScheduler {
     slot.focus = [...init.center] as [number, number, number];
     slot.renderFade = 1;
     slot.retiring = false;
+    slot.reboxing = false;
+    slot.classMismatchSince = Infinity;
     slot.stepCount = 0;
     return slot;
+  }
+
+  /** Which resolution class an island at this position deserves right now. */
+  classFor(center: Vec3, camera: CameraInfo): 'fine' | 'coarse' {
+    if (this.focusMode === 'events') return 'fine';
+    const d = len(sub(center, camera.position));
+    return d < 40 ? 'fine' : 'coarse';
   }
 
   free(island: IslandState): void {
     island.active = false;
     island.retiring = false;
+    island.reboxing = false;
+    island.classMismatchSince = Infinity;
     island.massKg = 0;
     island.estimatedMassKg = 0;
   }
@@ -194,7 +227,17 @@ export class IslandScheduler {
       const wRecent = 1 + 3 * Math.exp(-Math.max(0, now - i.lastEventAt) / 3);
       const facing = dot(norm(toC), camera.forward);
       const wCam = clamp(0.35 + 0.65 * (facing * 0.5 + 0.5), 0.35, 1);
-      i.importance = aScreen * tau * wDist * wInter * wRecent * wCam;
+      const wFocus = this.focusMode === 'camera' ? 1 / (1 + d / 25) + 0.25 : 1;
+      i.importance = aScreen * tau * wDist * wInter * wRecent * wCam * wFocus;
+
+      // Track how long the slot's resolution class has disagreed with what
+      // this island deserves (hysteresis input for the rebox controller).
+      const wantedCls = this.classFor(i.center, camera);
+      if (wantedCls !== i.cls && !i.retiring && !i.reboxing) {
+        if (i.classMismatchSince === Infinity) i.classMismatchSince = now;
+      } else {
+        i.classMismatchSince = Infinity;
+      }
 
       const threshold = 0.004;
       const negligibleMass = mass < 0.05 && now - i.lastEventAt > 2 && now - i.createdAt > 3;
@@ -208,13 +251,24 @@ export class IslandScheduler {
     }
   }
 
-  /** Islands due for a simulation step, ordered by importance, capped per frame. */
-  dueIslands(now: number, maxPerFrame: number): IslandState[] {
+  /**
+   * Islands due for a simulation step, ordered by importance, capped by a
+   * cell-update budget in FINE-slot equivalents (a coarse island costs 1/8 a
+   * fine one, so far dust no longer competes head-to-head with near dust).
+   */
+  dueIslands(now: number, budgetFineEquiv: number): IslandState[] {
     const due = this.activeIslands()
-      .filter((i) => now >= i.nextStepAt)
-      .sort((a, b) => b.importance - a.importance)
-      .slice(0, maxPerFrame);
-    return due;
+      .filter((i) => now >= i.nextStepAt && !i.reboxing)
+      .sort((a, b) => b.importance - a.importance);
+    const out: IslandState[] = [];
+    let budget = budgetFineEquiv * Math.max(this.qualityScale, 0.4);
+    for (const i of due) {
+      const cost = i.cls === 'coarse' ? 0.125 : 1;
+      if (budget < cost && out.length > 0) break;
+      out.push(i);
+      budget -= cost;
+    }
+    return out;
   }
 
   markStepped(i: IslandState, now: number): void {

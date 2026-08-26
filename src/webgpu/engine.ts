@@ -11,7 +11,8 @@ import {
 } from './solverKernels';
 import {
   VolumeAtlas, createAtlas, slotOffsetVox, initAtlasTextures, COARSE,
-  kWriteVolume, kLightMarch, kClearVolumeSlot, kDownsampleMass, kDownsampleAbsDiv,
+  kWriteVolume, kLightMarch, kLightSweep, kClearVolumeSlot, kDownsampleMass, kDownsampleMomentum, kDownsampleAbsDiv,
+  kReboxDensity, kReboxVelocity,
   kClearShell, kShift, kCopy, kPacketDensity, kPacketVelocity,
 } from './outputKernels';
 
@@ -25,7 +26,8 @@ export class IslandGPU {
   readonly fields: IslandFields;
   readonly uni = new IslandUniforms();
   readonly slot: number;
-  private readonly N: number;
+  readonly N: number;
+  readonly cls: 'fine' | 'coarse';
   private k: Record<string, any> = {};
   private jacobiEvenIters: number;
 
@@ -36,8 +38,12 @@ export class IslandGPU {
     preset: QualityPreset,
     slot: number,
   ) {
-    const N = preset.slotRes;
+    // Per-slot resolution: fine slots run at preset.slotRes, coarse slots at
+    // ~half (1/8 the cells) — the far-from-camera tier of the LOD pool. The
+    // scratch set passed in matches this slot's resolution class.
+    const N = atlas.slots[slot].res;
     this.N = N;
+    this.cls = atlas.slots[slot].cls;
     this.slot = slot;
     this.jacobiEvenIters = Math.ceil(preset.pressureIters / 2) * 2;
     this.fields = {
@@ -75,9 +81,16 @@ export class IslandGPU {
       sumMassPre: kSumCoarseMass(s.coarseMass, s.massStat, 0),
       sumMassPost: kSumCoarseMass(s.coarseMass, s.massStat, 1),
       writeVolume: kWriteVolume(f, s, uni, atlas),
-      light: kLightMarch(f, uni, atlas, preset.lightSteps),
+      // O(N³) sliced sweep is the default; ?lightpath=march keeps the legacy
+      // per-voxel march for A/B comparison and the CI equivalence test.
+      light: IslandGPU.useLegacyLightMarch()
+        ? kLightMarch(f, uni, atlas, preset.lightSteps)
+        : kLightSweep(f, uni, atlas),
       clearSlot: kClearVolumeSlot(this.N, uni, atlas),
       downMass: kDownsampleMass(f, s, uni),
+      downMom: kDownsampleMomentum(f, s, uni),
+      reboxDensity: kReboxDensity(f, uni, atlas),
+      reboxVel: [0, 1, 2].map((c) => kReboxVelocity(f, uni, atlas, c as 0 | 1 | 2)),
       downDivPre: kDownsampleAbsDiv(f, s, s.coarseDivPre),
       downDivPost: kDownsampleAbsDiv(f, s, s.coarseDivPost),
       clearShell: kClearShell(f, uni),
@@ -175,8 +188,38 @@ export class IslandGPU {
     if (flags.light) r.compute(k.light);
   }
 
+  static useLegacyLightMarch(): boolean {
+    return typeof location !== 'undefined' &&
+      new URLSearchParams(location.search).get('lightpath') === 'march';
+  }
+
   computeMassGrid(): void {
     this.renderer.compute(this.k.downMass);
+  }
+
+  /** Fill the shared coarseMom grid with this island's mass-weighted momentum. */
+  computeMomentumGrid(): void {
+    this.renderer.compute(this.k.downMom);
+  }
+
+  /**
+   * In-place re-tiering: resample another slot's atlas region into this
+   * island's fields, then bake this slot's atlas + light so it can render the
+   * same frame. Caller sets origin/size first (configureIslandPlacement) and
+   * the sweep frame (configureSweep).
+   */
+  reboxFrom(src: IslandGPU, srcOrigin: [number, number, number], srcSizeM: number): void {
+    const u = this.uni;
+    const off = (src.uni.slotOffsetVox.value as THREE.Vector3);
+    (u.reboxSrcOff.value as THREE.Vector3).copy(off);
+    (u.reboxSrcRes as any).value = src.N;
+    (u.reboxSrcOrigin.value as THREE.Vector3).set(srcOrigin[0], srcOrigin[1], srcOrigin[2]);
+    (u.reboxSrcSize as any).value = srcSizeM;
+    const r = this.renderer;
+    r.compute(this.k.reboxDensity);
+    for (const kv of this.k.reboxVel) r.compute(kv);
+    r.compute(this.k.writeVolume);
+    r.compute(this.k.light);
   }
 
   clearShell(keep: number, shellVox: number): void {
@@ -195,30 +238,45 @@ export class SolverEngine {
 
   constructor(readonly renderer: THREE.WebGPURenderer, preset: QualityPreset) {
     this.preset = preset;
-    const N = preset.slotRes;
-    this.atlas = createAtlas(N, preset.slots);
+    this.atlas = createAtlas(preset.slotRes, preset.slotClasses);
     initAtlasTextures(renderer, this.atlas);
-    this.scratch = {
-      uT: makeField(N + 1, N, N, 1, 'uT'),
-      vT: makeField(N, N + 1, N, 1, 'vT'),
-      wT: makeField(N, N, N + 1, 1, 'wT'),
-      dHatA: makeField(N, N, N, 4, 'dHatA'),
-      dHatB: makeField(N, N, N, 4, 'dHatB'),
-      dTilA: makeField(N, N, N, 4, 'dTilA'),
-      dTilB: makeField(N, N, N, 4, 'dTilB'),
-      posBuf: makeField(N, N, N, 4, 'posBuf'),
-      p0: makeField(N, N, N, 1, 'p0'),
-      p1: makeField(N, N, N, 1, 'p1'),
-      div: makeField(N, N, N, 1, 'div'),
-      curl: makeField(N, N, N, 4, 'curl'),
-      solid: makeField(N, N, N, 4, 'solid'),
+
+    // One scratch set per resolution class; the small readback grids (16³
+    // coarse mass/momentum/divergence + the mass stat) are shared across
+    // classes so CPU readers have a single source regardless of who wrote.
+    const shared = {
       coarseMass: makeField(COARSE, COARSE, COARSE, 4, 'coarseMass'),
+      coarseMom: makeField(COARSE, COARSE, COARSE, 4, 'coarseMom'),
       coarseDivPre: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPre'),
       coarseDivPost: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPost'),
       massStat: makeField(1, 1, 1, 4, 'massStat'),
     };
+    const makeScratch = (N: number, tag: string): ScratchFields => ({
+      uT: makeField(N + 1, N, N, 1, `uT${tag}`),
+      vT: makeField(N, N + 1, N, 1, `vT${tag}`),
+      wT: makeField(N, N, N + 1, 1, `wT${tag}`),
+      dHatA: makeField(N, N, N, 4, `dHatA${tag}`),
+      dHatB: makeField(N, N, N, 4, `dHatB${tag}`),
+      dTilA: makeField(N, N, N, 4, `dTilA${tag}`),
+      dTilB: makeField(N, N, N, 4, `dTilB${tag}`),
+      posBuf: makeField(N, N, N, 4, `posBuf${tag}`),
+      p0: makeField(N, N, N, 1, `p0${tag}`),
+      p1: makeField(N, N, N, 1, `p1${tag}`),
+      div: makeField(N, N, N, 1, `div${tag}`),
+      curl: makeField(N, N, N, 4, `curl${tag}`),
+      solid: makeField(N, N, N, 4, `solid${tag}`),
+      ...shared,
+    });
+    this.scratch = makeScratch(preset.slotRes, '');
+    const hasCoarse = this.atlas.slots.some((sl) => sl.cls === 'coarse');
+    const coarseScratch = hasCoarse
+      ? makeScratch(this.atlas.slots.find((sl) => sl.cls === 'coarse')!.res, 'C')
+      : this.scratch;
     for (let sIdx = 0; sIdx < preset.slots; sIdx++) {
-      this.islands.push(new IslandGPU(renderer, this.scratch, this.atlas, preset, sIdx));
+      const cls = this.atlas.slots[sIdx].cls;
+      this.islands.push(new IslandGPU(
+        renderer, cls === 'fine' ? this.scratch : coarseScratch, this.atlas, preset, sIdx,
+      ));
     }
   }
 

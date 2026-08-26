@@ -60,6 +60,8 @@ interface RetireJob {
  */
 export class VolumetricWorld {
   readonly renderer: THREE.WebGPURenderer;
+  /** True when running on a software WebGPU adapter (SwiftShader/llvmpipe). */
+  softwareAdapter = false;
   readonly preset: QualityPreset;
   readonly engine: SolverEngine;
   readonly pass: VolumetricPass;
@@ -115,10 +117,16 @@ export class VolumetricWorld {
     if (!('gpu' in navigator)) {
       throw new Error('WebGPU is not available in this browser (volumetric-world requires WebGPU).');
     }
+    // Software adapters (SwiftShader) never complete timestamp-query readbacks,
+    // and one stuck mapAsync blocks every later buffer callback (FIFO delivery) —
+    // so GPU timings are only tracked on real hardware.
+    const probeAdapter = await (navigator as any).gpu.requestAdapter();
+    const arch = probeAdapter?.info?.architecture ?? '';
+    const softwareAdapter = /swiftshader|llvmpipe|software/i.test(arch);
     const renderer = new THREE.WebGPURenderer({
       canvas,
       antialias: false,
-      trackTimestamp: true,
+      trackTimestamp: !softwareAdapter,
       forceWebGL: false,
     });
     await renderer.init();
@@ -128,7 +136,9 @@ export class VolumetricWorld {
     }
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    return new VolumetricWorld(renderer, opts);
+    const world = new VolumetricWorld(renderer, opts);
+    world.softwareAdapter = softwareAdapter;
+    return world;
   }
 
   // ------------------------------------------------------------------
@@ -676,6 +686,7 @@ export class VolumetricWorld {
 
   private gpuTimingsPending = false;
   private resolveGpuTimings(): void {
+    if (!(this.renderer as any).trackTimestamp) return;
     if (this.gpuTimingsPending) return;
     this.gpuTimingsPending = true;
     Promise.all([

@@ -3,8 +3,7 @@ import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, int, ivec2, vec2, vec3, vec4,
   uniform, uniformArray, texture, texture3D, textureLoad, uv,
-  min, max, clamp, exp, sqrt, pow, mix, smoothstep, normalize, length, dot, fract,
-  mx_noise_float,
+  min, max, clamp, exp, sqrt, pow, mix, smoothstep, normalize, length, dot, fract, floor, sin,
 } from 'three/tsl';
 import type { VolumeAtlas } from '../webgpu/outputKernels';
 
@@ -28,6 +27,11 @@ export class VolumetricPass {
   // Render targets
   sceneRT: THREE.RenderTarget;
   histRT: [THREE.RenderTarget, THREE.RenderTarget];
+  /** Final composite target used in 'readback' present mode (headless CI). */
+  outRT: THREE.RenderTarget | null = null;
+  /** 'canvas' presents to the WebGPU canvas; 'readback' composites into a
+   * readable target instead (SwiftShader headless crashes on presentation). */
+  presentMode: 'canvas' | 'readback' = 'canvas';
   private frame = 0;
 
   // Uniforms
@@ -67,12 +71,18 @@ export class VolumetricPass {
   private sceneTexNode: any;
   private renderScale: number;
 
+  /** Compile-time shader bisect level (dev): 0 full | 1 no packets | 2 no islands | 3 flat. */
+  private buildLevel = 0;
+
   constructor(
     private renderer: THREE.WebGPURenderer,
     private atlas: VolumeAtlas,
     opts: { renderScale: number; maxRenderPackets: number; temporal: boolean },
   ) {
     this.renderScale = opts.renderScale;
+    if (typeof location !== 'undefined') {
+      this.buildLevel = Number(new URLSearchParams(location.search).get('mlevel') ?? 0);
+    }
     this.packets = uniformArray(v4arr(opts.maxRenderPackets * PKT_STRIDE));
 
     const w = 8, h = 8; // resized on first setSize
@@ -117,6 +127,38 @@ export class VolumetricPass {
     this.histRT[1].setSize(hw, hh);
     (this.fullSize.value as THREE.Vector2).set(w, h);
     (this.halfSize.value as THREE.Vector2).set(hw, hh);
+    this.outRT?.setSize(w, h);
+  }
+
+  enableReadbackPresent(): void {
+    this.presentMode = 'readback';
+    if (!this.outRT) {
+      this.outRT = new THREE.RenderTarget(this.sceneRT.width, this.sceneRT.height, {
+        type: THREE.UnsignedByteType,
+      });
+      this.outRT.texture.name = 'finalOut';
+    }
+  }
+
+  /** Read the composite target and draw it into a 2D canvas (readback mode). */
+  async blitToCanvas2D(ctx: CanvasRenderingContext2D): Promise<void> {
+    if (!this.outRT) return;
+    const w = this.outRT.width;
+    const h = this.outRT.height;
+    const pixels = (await (this.renderer as any).readRenderTargetPixelsAsync(
+      this.outRT, 0, 0, w, h,
+    )) as Uint8Array;
+    // The returned buffer keeps WebGPU's 256-byte row alignment — unpad it.
+    const rowBytes = w * 4;
+    const paddedRow = Math.ceil(rowBytes / 256) * 256;
+    const tight = new Uint8ClampedArray(rowBytes * h);
+    for (let row = 0; row < h; row++) {
+      tight.set(new Uint8Array(pixels.buffer as ArrayBuffer, pixels.byteOffset + row * paddedRow, rowBytes), row * rowBytes);
+    }
+    const img = new ImageData(tight, w, h);
+    ctx.canvas.width = w;
+    ctx.canvas.height = h;
+    ctx.putImageData(img, 0, 0);
   }
 
   /** World position + opaque distance reconstruction (WebGPU depth convention). */
@@ -157,9 +199,31 @@ export class VolumetricPass {
     return g2.oneMinus().div(denom).mul(0.0796); // 1/(4π)
   }
 
+  /** Compact trilinear value noise (sin-hash) — tiny WGSL footprint vs. MaterialX noise. */
+  private valueNoise(p: any) {
+    const ip = floor(p).toVar();
+    const fp = fract(p).toVar();
+    const f = fp.mul(fp).mul(fp.mul(-2).add(3)).toVar();
+    const h = (o: any) =>
+      fract(sin(dot(ip.add(o), vec3(127.1, 311.7, 74.7))).mul(43758.5453));
+    const n000 = h(vec3(0, 0, 0));
+    const n100 = h(vec3(1, 0, 0));
+    const n010 = h(vec3(0, 1, 0));
+    const n110 = h(vec3(1, 1, 0));
+    const n001 = h(vec3(0, 0, 1));
+    const n101 = h(vec3(1, 0, 1));
+    const n011 = h(vec3(0, 1, 1));
+    const n111 = h(vec3(1, 1, 1));
+    const nx00 = mix(n000, n100, f.x);
+    const nx10 = mix(n010, n110, f.x);
+    const nx01 = mix(n001, n101, f.x);
+    const nx11 = mix(n011, n111, f.x);
+    return mix(mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z).mul(2).sub(1);
+  }
+
   private fbm(p: any) {
-    const n1 = mx_noise_float(p);
-    const n2 = mx_noise_float(p.mul(2.73).add(vec3(11.31, 7.7, 5.1))).mul(0.5);
+    const n1 = this.valueNoise(p);
+    const n2 = this.valueNoise(p.mul(2.73).add(vec3(11.31, 7.7, 5.1))).mul(0.5);
     return n1.add(n2).mul(0.666); // ≈ [-1, 1]
   }
 
@@ -168,6 +232,9 @@ export class VolumetricPass {
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
     const N = float(atlas.slotRes);
 
+    if (this.buildLevel >= 3) {
+      return Fn(() => vec4(0.0, 0.0, 0.0, 1.0))();
+    }
     return Fn(() => {
       const uvN = uv().toVar();
       const { world: opaqueWorld } = this.reconstruct(uvN);
@@ -204,7 +271,7 @@ export class VolumetricPass {
         });
       }
       const pcnt = int(this.packetCount).toVar();
-      Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
+      if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
         const base = i.mul(int(PKT_STRIDE));
         const r0 = this.packets.element(base);
         const r1 = this.packets.element(base.add(int(1)));
@@ -253,7 +320,7 @@ export class VolumetricPass {
           const sunTrans = float(1).toVar();
 
           // --- simulation islands (statically unrolled; atlas keeps bindings at 4 textures) ---
-          for (let s = 0; s < MAX_ISLANDS; s++) {
+          for (let s = 0; s < (this.buildLevel < 2 ? MAX_ISLANDS : 0); s++) {
             const m0 = this.islandMeta.element(int(s * ISLE_STRIDE));
             const m1 = this.islandMeta.element(int(s * ISLE_STRIDE + 1));
             const m2 = this.islandMeta.element(int(s * ISLE_STRIDE + 2));
@@ -272,18 +339,22 @@ export class VolumetricPass {
                 const a = texture3D(atlas.texA, uvw, int(0)).toVar();
                 If(a.w.greaterThan(1e-4), () => {
                   const b = texture3D(atlas.texB, uvw, int(0)).toVar();
-                  // Sub-grid detail: advected-phase fbm modulation with edge erosion.
-                  const nPos = p2.div(this.detailScale).add(vec3(float(s).mul(7.31))).toVar();
-                  const n01 = this.fbm(nPos).mul(0.5).add(0.5).toVar();
-                  const sLum0 = dot(a.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
-                  const edge = smoothstep(1.2, 0.05, sLum0).toVar();
-                  const m = clamp(
-                    n01.mul(this.detailStrength).mul(1.9)
-                      .add(float(1.0).sub(this.detailStrength.mul(0.75)))
-                      .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
-                    0.0,
-                    2.2,
-                  ).toVar();
+                  // Sub-grid detail: advected-phase fbm modulation with edge erosion
+                  // (skipped entirely when detail is disabled — software adapters).
+                  const m = float(1.0).toVar();
+                  If(this.detailStrength.greaterThan(0.01), () => {
+                    const nPos = p2.div(this.detailScale).add(vec3(float(s).mul(7.31))).toVar();
+                    const n01 = this.fbm(nPos).mul(0.5).add(0.5).toVar();
+                    const sLum0 = dot(a.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
+                    const edge = smoothstep(1.2, 0.05, sLum0).toVar();
+                    m.assign(clamp(
+                      n01.mul(this.detailStrength).mul(1.9)
+                        .add(float(1.0).sub(this.detailStrength.mul(0.75)))
+                        .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
+                      0.0,
+                      2.2,
+                    ));
+                  });
                   const st = a.xyz.mul(m).mul(m2.y).toVar();
                   sigT.addAssign(st);
                   sigS.addAssign(st.mul(b.xyz));
@@ -296,7 +367,7 @@ export class VolumetricPass {
           }
 
           // --- far-field volume packets (analytic anisotropic Gaussians) ---
-          Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ j }: any) => {
+          if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i: j }: any) => {
             const base = j.mul(int(PKT_STRIDE));
             const r0 = this.packets.element(base).toVar();
             const r1 = this.packets.element(base.add(int(1))).toVar();
@@ -307,14 +378,17 @@ export class VolumetricPass {
               const r3 = this.packets.element(base.add(int(3))).toVar();
               const r4 = this.packets.element(base.add(int(4))).toVar();
               const gaus = exp(q.mul(-0.5)).mul(r0.w).toVar();
-              const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).add(r4.w).toVar();
-              const n01 = this.fbm(pd).mul(0.5).add(0.5);
-              const m = clamp(
-                n01.mul(this.detailStrength).mul(1.7).add(float(1.0).sub(this.detailStrength.mul(0.7)))
-                  .sub(smoothstep(0.6, 0.05, gaus.mul(dot(r2.xyz, vec3(1.0)))).mul(this.detailStrength).mul(n01.oneMinus())),
-                0.0,
-                2.0,
-              );
+              const m = float(1.0).toVar();
+              If(this.detailStrength.greaterThan(0.01), () => {
+                const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).add(r4.w).toVar();
+                const n01 = this.fbm(pd).mul(0.5).add(0.5);
+                m.assign(clamp(
+                  n01.mul(this.detailStrength).mul(1.7).add(float(1.0).sub(this.detailStrength.mul(0.7)))
+                    .sub(smoothstep(0.6, 0.05, gaus.mul(dot(r2.xyz, vec3(1.0)))).mul(this.detailStrength).mul(n01.oneMinus())),
+                  0.0,
+                  2.0,
+                ));
+              });
               const st = r2.xyz.mul(gaus).mul(m).toVar();
               sigT.addAssign(st);
               sigS.addAssign(st.mul(r3.xyz));
@@ -406,7 +480,7 @@ export class VolumetricPass {
 
       // Dust shadows cast onto the opaque world (sun transmittance caches + packets).
       const shadowF = float(1).toVar();
-      for (let s = 0; s < MAX_ISLANDS; s++) {
+      for (let s = 0; s < (this.buildLevel < 2 ? MAX_ISLANDS : 0); s++) {
         const m0 = this.islandMeta.element(int(s * ISLE_STRIDE));
         const m1 = this.islandMeta.element(int(s * ISLE_STRIDE + 1));
         If(m1.w.greaterThan(0.5), () => {
@@ -421,7 +495,7 @@ export class VolumetricPass {
         });
       }
       const pcnt = int(this.packetCount).toVar();
-      Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
+      if (this.buildLevel < 1) Loop({ start: int(0), end: pcnt, type: 'int', condition: '<' }, ({ i }: any) => {
         const od = this.packetRayOD(i.mul(int(PKT_STRIDE)), world, this.sunDir);
         shadowF.mulAssign(exp(od.negate().mul(0.7)));
       });
@@ -471,11 +545,12 @@ export class VolumetricPass {
     r.setRenderTarget(this.histRT[cur]);
     this.quad.render(r);
 
-    // 3) composite to screen
+    // 3) composite to screen (or to a readable target in headless CI)
     (this.volTexNode as any).value = this.histRT[cur].texture;
     this.quad.material = this.compositeMat;
-    r.setRenderTarget(null);
+    r.setRenderTarget(this.presentMode === 'readback' ? this.outRT : null);
     this.quad.render(r);
+    r.setRenderTarget(null);
 
     // Save this frame's view-projection for next-frame reprojection.
     prevVP.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);

@@ -20,7 +20,7 @@ interface TestApi {
   sceneId: string;
   /** Deterministic stepping: scene tick + every island + packets, n times. */
   step(dt: number, n?: number): void;
-  render(): void;
+  render(): Promise<void>;
   metrics(): Promise<WorldMetrics>;
   /** Mass (kg) inside a world-space AABB, summed from island coarse grids + packets. */
   massInRegion(min: Vec3, max: Vec3): Promise<number>;
@@ -47,6 +47,22 @@ async function boot(): Promise<void> {
   const env = buildEnvironment(world, scene);
   const def = sceneById(sceneId);
   const ctx: SceneCtx = { env, world, scene, camera, state: {} };
+
+  // SwiftShader/headless crashes on WebGPU canvas presentation — composite into
+  // a readable target and blit through a 2D canvas instead.
+  const readbackPresent = params.get('present') === 'readback' || world.softwareAdapter;
+  let ctx2d: CanvasRenderingContext2D | null = null;
+  if (readbackPresent) {
+    world.pass.enableReadbackPresent();
+    const shot = document.createElement('canvas');
+    shot.id = 'shot';
+    shot.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;z-index:2;pointer-events:none;';
+    document.body.appendChild(shot);
+    ctx2d = shot.getContext('2d');
+  }
+  const present = async (): Promise<void> => {
+    if (ctx2d) await world.pass.blitToCanvas2D(ctx2d);
+  };
 
   const resize = (): void => {
     const dpr = testMode ? 1 : Math.min(window.devicePixelRatio, 1.5);
@@ -82,9 +98,10 @@ async function boot(): Promise<void> {
         world.stepAll(dt);
       }
     },
-    render() {
+    async render() {
       camera.updateMatrixWorld();
       world.render(scene, camera);
+      await present();
     },
     metrics: () => world.metrics(),
     async massInRegion(min: Vec3, max: Vec3): Promise<number> {
@@ -128,8 +145,12 @@ async function boot(): Promise<void> {
   window.__vw = api;
 
   if (testMode) {
-    // Deterministic manual stepping only; a single warm-up render compiles pipelines.
-    world.render(scene, camera);
+    // Deterministic manual stepping only; a warm-up render compiles pipelines
+    // (skippable for pure-simulation metric tests via norender=1).
+    if (params.get('norender') !== '1') {
+      world.render(scene, camera);
+      await present();
+    }
     window.__vwReady = true;
     document.getElementById('loading')?.remove();
     return;
@@ -149,6 +170,7 @@ async function boot(): Promise<void> {
       world.update(dt, camera);
     }
     world.render(scene, camera);
+    void present();
     hud.update();
   };
   window.__vwReady = true;

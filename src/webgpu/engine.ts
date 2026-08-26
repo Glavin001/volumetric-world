@@ -10,7 +10,7 @@ import {
   kDensityForward, kDensityReverse, kDensityCorrect, kDensityCommit,
 } from './solverKernels';
 import {
-  VolumeAtlas, createAtlas, slotOffsetVox, COARSE,
+  VolumeAtlas, createAtlas, slotOffsetVox, initAtlasTextures, COARSE,
   kWriteVolume, kLightMarch, kClearVolumeSlot, kDownsampleMass, kDownsampleAbsDiv,
   kClearShell, kShift, kCopy, kPacketDensity, kPacketVelocity,
 } from './outputKernels';
@@ -189,6 +189,7 @@ export class SolverEngine {
     this.preset = preset;
     const N = preset.slotRes;
     this.atlas = createAtlas(N, preset.slots);
+    initAtlasTextures(renderer, this.atlas);
     this.scratch = {
       uT: makeField(N + 1, N, N, 1, 'uT'),
       vT: makeField(N, N + 1, N, 1, 'vT'),

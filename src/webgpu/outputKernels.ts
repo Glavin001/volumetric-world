@@ -56,6 +56,35 @@ export function slotOffsetVox(atlas: VolumeAtlas, slot: number): [number, number
   return [(slot % sx) * atlas.slotRes, Math.floor(slot / sx) * atlas.slotRes, 0];
 }
 
+/**
+ * Fully initialize the atlas textures with an explicit writeTexture upload.
+ * three creates 3D storage textures with RENDER_ATTACHMENT usage, and Dawn's
+ * lazy zero-initialization then tries to clear them through 2D attachment
+ * views — invalid for 3D textures (fails the whole submit on SwiftShader).
+ * Writing every texel once marks the subresource initialized and sets sane
+ * defaults (shadow = 1, albedo = 0.5).
+ */
+export function initAtlasTextures(renderer: THREE.WebGPURenderer, atlas: VolumeAtlas): void {
+  const backend: any = (renderer as any).backend;
+  const device: GPUDevice = backend.device;
+  const upload = (t: THREE.Storage3DTexture, bytesPerTexel: number, fill: (b: Uint8Array) => void) => {
+    renderer.initTexture(t);
+    const gpuTex: GPUTexture = backend.get(t).texture;
+    const data = new Uint8Array(atlas.dimX * atlas.dimY * atlas.dimZ * bytesPerTexel);
+    fill(data);
+    device.queue.writeTexture(
+      { texture: gpuTex },
+      data,
+      { bytesPerRow: atlas.dimX * bytesPerTexel, rowsPerImage: atlas.dimY },
+      { width: atlas.dimX, height: atlas.dimY, depthOrArrayLayers: atlas.dimZ },
+    );
+  };
+  upload(atlas.texA, 8, () => {});
+  upload(atlas.texVel, 8, () => {});
+  upload(atlas.texB, 4, (b) => b.fill(0x80));
+  upload(atlas.texShadow, 4, (b) => b.fill(0xff));
+}
+
 const MAX_SIGMA_T = 250.0;
 
 /** Bake density moments + center velocity into the render atlas (with soft slot-edge fade). */
@@ -179,8 +208,8 @@ export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUn
       const acc = vec4(0.0).toVar();
       const cellVol = uni.h.mul(uni.h).mul(uni.h).toVar();
       Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i }: any) => {
-        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ j }: any) => {
-          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ k }: any) => {
+        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: j }: any) => {
+          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: k }: any) => {
             const cx = x.mul(int(block)).add(k).toVar();
             const cy = y.mul(int(block)).add(j).toVar();
             const cz = z.mul(int(block)).add(i).toVar();
@@ -207,8 +236,8 @@ export function kDownsampleAbsDiv(f: IslandFields, s: ScratchFields, dst: GpuFie
       const { x, y, z } = fieldCoord(dst, instanceIndex);
       const acc = vec4(0.0).toVar();
       Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i }: any) => {
-        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ j }: any) => {
-          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ k }: any) => {
+        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: j }: any) => {
+          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: k }: any) => {
             const cx = x.mul(int(block)).add(k);
             const cy = y.mul(int(block)).add(j);
             const cz = z.mul(int(block)).add(i);

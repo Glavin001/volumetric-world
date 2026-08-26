@@ -201,30 +201,7 @@ export class PacketSystem {
         const rb = Math.max(...b.radii);
         const dv = len(sub(a.velocity, b.velocity));
         if (d < 0.55 * (ra + rb) && dv < 1.2) {
-          const m = a.massKg + b.massKg;
-          const wa = a.massKg / m;
-          const wb = b.massKg / m;
-          for (let c = 0; c < 3; c++) {
-            const mean = a.position[c] * wa + b.position[c] * wb;
-            const va =
-              wa * (a.radii[c] ** 2 + (a.position[c] - mean) ** 2) +
-              wb * (b.radii[c] ** 2 + (b.position[c] - mean) ** 2);
-            a.position[c] = mean;
-            a.radii[c] = Math.sqrt(va);
-            a.velocity[c] = a.velocity[c] * wa + b.velocity[c] * wb;
-            a.extPerMassRgb = [
-              a.extPerMassRgb[0] * wa + b.extPerMassRgb[0] * wb,
-              a.extPerMassRgb[1] * wa + b.extPerMassRgb[1] * wb,
-              a.extPerMassRgb[2] * wa + b.extPerMassRgb[2] * wb,
-            ];
-            a.albedoRgb = [
-              a.albedoRgb[0] * wa + b.albedoRgb[0] * wb,
-              a.albedoRgb[1] * wa + b.albedoRgb[1] * wb,
-              a.albedoRgb[2] * wa + b.albedoRgb[2] * wb,
-            ];
-            a.phaseG = a.phaseG * wa + b.phaseG * wb;
-          }
-          a.massKg = m;
+          PacketSystem.foldInto(a, b);
           b.massKg = 0;
         }
       }
@@ -265,12 +242,57 @@ export class PacketSystem {
 
   private enforceBudget(): void {
     if (this.packets.length <= this.maxPackets) return;
-    // Drop the least optically significant packets first.
+    // Keep the most optically significant packets; the overflow is FOLDED into
+    // each one's nearest survivor (moment-matched merge) rather than deleted —
+    // the budget is a level-of-detail decision and must never destroy mass.
     this.packets.sort(
       (a, b) =>
         PacketSystem.peakSigmaT(b) * Math.max(...b.radii) - PacketSystem.peakSigmaT(a) * Math.max(...a.radii),
     );
-    this.packets.length = this.maxPackets;
+    const survivors = this.packets.slice(0, this.maxPackets);
+    const overflow = this.packets.slice(this.maxPackets);
+    for (const p of overflow) {
+      let best = survivors[0];
+      let bestD = Infinity;
+      for (const s of survivors) {
+        const d = len(sub(p.position, s.position));
+        if (d < bestD) {
+          bestD = d;
+          best = s;
+        }
+      }
+      PacketSystem.foldInto(best, p);
+    }
+    this.packets = survivors;
+  }
+
+  /** Moment-matched absorb of `b` into `a` (mass, position, spread, velocity, optics). */
+  private static foldInto(a: VolumePacket, b: VolumePacket): void {
+    const m = a.massKg + b.massKg;
+    if (m <= 0) return;
+    const wa = a.massKg / m;
+    const wb = b.massKg / m;
+    for (let c = 0; c < 3; c++) {
+      const mean = a.position[c] * wa + b.position[c] * wb;
+      const va =
+        wa * (a.radii[c] ** 2 + (a.position[c] - mean) ** 2) +
+        wb * (b.radii[c] ** 2 + (b.position[c] - mean) ** 2);
+      a.position[c] = mean;
+      a.radii[c] = Math.sqrt(va);
+      a.velocity[c] = a.velocity[c] * wa + b.velocity[c] * wb;
+    }
+    a.extPerMassRgb = [
+      a.extPerMassRgb[0] * wa + b.extPerMassRgb[0] * wb,
+      a.extPerMassRgb[1] * wa + b.extPerMassRgb[1] * wb,
+      a.extPerMassRgb[2] * wa + b.extPerMassRgb[2] * wb,
+    ];
+    a.albedoRgb = [
+      a.albedoRgb[0] * wa + b.albedoRgb[0] * wb,
+      a.albedoRgb[1] * wa + b.albedoRgb[1] * wb,
+      a.albedoRgb[2] * wa + b.albedoRgb[2] * wb,
+    ];
+    a.phaseG = a.phaseG * wa + b.phaseG * wb;
+    a.massKg = m;
   }
 
   /** Remove and return packets intersecting the given AABB (for packet→grid promotion). */

@@ -6,7 +6,9 @@ import { uniform, uniformArray } from 'three/tsl';
 export const MAX_PRIMS = 24;
 export const PRIM_STRIDE = 7; // q0 meta | q1 pos+planeStart | q2 quat | q3 params | q4 linVel+wakeEnabled | q5 angVel | q6 prevPos+boundR
 export const MAX_PLANES = 96;
-export const MAX_EVENTS = 10;
+// Sized for a multi-building collapse: several structures × 3 emission events
+// each can overlap in time (packEvents drops overflow silently).
+export const MAX_EVENTS = 16;
 export const EVT_STRIDE = 7; // e0 kinds+loadRate+phaseWRate | e1 pos+r | e2 aux+r2 | e3 quat | e4 extRate+momAux | e5 scatRate+momCouple | e6 momVec
 export const MAX_EFFECTORS = 8;
 export const EFF_STRIDE = 4; // f0 kind+radius+strength+aux | f1 posA | f2 posB/axis | f3 vel+couple

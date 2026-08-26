@@ -15,6 +15,7 @@ import {
   ActiveEmission, ActiveEffector, WorldPrim, activateEmission, effectorDuration, flattenShape,
   packEffectors, packEvents, packPrims, packPromo, primFromBody, sourceBoundR, sourceCenter,
 } from '../webgpu/packing';
+import { MAX_PROMO } from '../webgpu/uniforms';
 import { VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE } from './volumetricPass';
 import { QID } from '../core/math';
 import type { AerosolMaterial, QualityPreset } from '../core/types';
@@ -535,7 +536,7 @@ export class VolumetricWorld {
         }
         const protos = packetsFromCoarseGrid(shellGrid, c, island.origin, island.sizeM, 0.05);
         for (const p of protos) {
-          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg * 0.92, [...this.wind] as Vec3, island.slot, 0.35);
+          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, [...this.wind] as Vec3, island.slot, 0.35);
         }
         gpu.clearShell(0, this.preset.slotRes / COARSE);
         island.lastExportAt = this.simTime;
@@ -614,9 +615,15 @@ export class VolumetricWorld {
     this.configureIslandPlacement(island);
     const gpu = this.gpuFor(island);
     gpu.reset();
-    packPromo(gpu.uni, cluster);
+    // The GPU can only voxelize MAX_PROMO packets — inject the heaviest and
+    // RETURN the rest to the pool (they used to vanish, silently losing mass).
+    cluster.sort((a, b) => b.massKg - a.massKg);
+    const injected = cluster.slice(0, MAX_PROMO);
+    for (const p of cluster.slice(MAX_PROMO)) this.packets.packets.push(p);
+    const injectedMass = injected.reduce((m, p) => m + p.massKg, 0);
+    packPromo(gpu.uni, injected);
     gpu.injectPromotedPackets();
-    island.estimatedMassKg = mass;
+    island.estimatedMassKg = injectedMass;
     island.lastEventAt = this.simTime;
     this.promoteCooldownUntil = this.simTime + 3;
     return true;
@@ -749,12 +756,19 @@ export class VolumetricWorld {
 
   private gpuTimingsPending = false;
   private resolveGpuTimings(): void {
-    if (!(this.renderer as any).trackTimestamp) return;
+    // In three r180 `trackTimestamp` lives on the BACKEND (narrowed by the
+    // timestamp-query feature check during init), not on the renderer — the
+    // old renderer-level guard was always undefined, so timings never resolved
+    // and the GPU-budget quality controller was flying blind on real GPUs.
+    if (!(this.renderer as any).backend?.trackTimestamp) return;
     if (this.gpuTimingsPending) return;
     this.gpuTimingsPending = true;
+    // Resolve BOTH pools every frame: each pool holds 2048 queries and this
+    // engine issues dozens of compute dispatches per island step, so an
+    // unresolved pool exhausts within seconds and timing silently stops.
     Promise.all([
-      (this.renderer as any).resolveTimestampsAsync?.('render'),
-      (this.renderer as any).resolveTimestampsAsync?.('compute'),
+      this.renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER),
+      this.renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE),
     ])
       .then(() => {
         const info: any = this.renderer.info;

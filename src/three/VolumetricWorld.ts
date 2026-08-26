@@ -232,6 +232,9 @@ export class VolumetricWorld {
       }
     }
     if (island) {
+      // Ownership: exactly one island injects this emission, even when several
+      // overlap the source region (overlapping injection double-counted mass).
+      em.ownerSlot = island.slot;
       island.lastEventAt = this.simTime;
       island.estimatedMassKg += ev.fineMassKg;
       this.islandMaterial.set(island.slot, material);
@@ -356,10 +359,11 @@ export class VolumetricWorld {
       }
     }
 
-    // Packet→grid promotion checks (2 Hz).
+    // Packet→grid promotion checks + island overlap resolution (2 Hz).
     if (this.simTime - this.lastPromoteCheck > 0.5) {
       this.lastPromoteCheck = this.simTime;
       this.autoPromote();
+      this.resolveIslandOverlaps();
     }
 
     // Expired emissions/effectors cleanup.
@@ -448,7 +452,12 @@ export class VolumetricWorld {
     const bmin: Vec3 = [...island.origin] as Vec3;
     const bmax: Vec3 = [island.origin[0] + island.sizeM, island.origin[1] + island.sizeM, island.origin[2] + island.sizeM];
     packPrims(uni, this.buildPrimList(island), bmin, bmax);
-    packEvents(uni, this.overlappingEmissions(bmin, bmax), this.simTime, (id) => this.bodies.get(id)?.linearVelocityMps);
+    packEvents(
+      uni,
+      this.overlappingEmissions(bmin, bmax).filter((em) => em.ownerSlot === island.slot),
+      this.simTime,
+      (id) => this.bodies.get(id)?.linearVelocityMps,
+    );
     packEffectors(uni, this.effectors, this.simTime, dt);
 
     (uni.dt as any).value = dt;
@@ -680,9 +689,40 @@ export class VolumetricWorld {
     freshGpu.reboxFrom(this.gpuFor(candidate), candidate.origin, candidate.sizeM);
     fresh.lastLightAt = this.simTime;
 
+    for (const em of this.emissions) {
+      if (em.ownerSlot === candidate.slot) em.ownerSlot = fresh.slot;
+    }
     candidate.reboxing = true;
     this.reboxJobs.push({ oldIsland: candidate, newIsland: fresh, end: this.simTime + 0.3 });
     this.lastReboxAt = this.simTime;
+  }
+
+  /**
+   * Two active fluid islands are two INDEPENDENT simulations: where they
+   * overlap heavily the medium is double-rendered and both fields evolve
+   * unaware of each other. Retire the less important one — its mass exports
+   * to packets with momentum and crossfades, and the survivor's emissions
+   * ownership keeps sources single-counted.
+   */
+  private resolveIslandOverlaps(): void {
+    const act = this.scheduler.activeIslands().filter((i) => !i.retiring && !i.reboxing);
+    for (let a = 0; a < act.length; a++) {
+      for (let b = a + 1; b < act.length; b++) {
+        const A = act[a];
+        const B = act[b];
+        let overlapVol = 1;
+        for (let c = 0; c < 3; c++) {
+          const lo = Math.max(A.origin[c], B.origin[c]);
+          const hi = Math.min(A.origin[c] + A.sizeM, B.origin[c] + B.sizeM);
+          overlapVol *= Math.max(0, hi - lo);
+        }
+        const smallerVol = Math.min(A.sizeM ** 3, B.sizeM ** 3);
+        if (overlapVol > smallerVol * 0.55) {
+          const loser = A.importance < B.importance ? A : B;
+          loser.retiring = true;
+        }
+      }
+    }
   }
 
   private applyBodyWakesToPackets(dt: number): void {

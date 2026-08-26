@@ -52,6 +52,45 @@ npm run screenshots  # regenerates docs/screenshots/*.png
 
 Requires WebGPU (Chrome/Edge 121+, desktop GPU recommended). On Linux launch Chrome with `--enable-unsafe-webgpu --enable-features=Vulkan`. Scene/quality picked via URL: `?scene=cityblock&preset=high`.
 
+## What is new in V2 — "one cohesive medium"
+
+The V1 engine proved the physics; V2 makes the multi-scale machinery read as
+ONE medium and allocates fidelity **relative to the viewer**:
+
+- **Viewer-centric LOD**: the island pool is mixed-resolution (2 fine + 2
+  coarse slots; coarse ≈ half res = 1/8 the cells at 0.6× the rate). The
+  scheduler's `focusMode` (default `camera`, HUD toggle / `?focus=events`)
+  assigns fine slots and high rates near the viewer and re-tiers islands **in
+  place** as the camera moves: a GPU "rebox" kernel resamples the old slot's
+  atlas region into a new slot (density, optics, velocity — no CPU readback,
+  no packet round-trip) under a 0.3 s crossfade. Try the `avenue` scene
+  (~300 m, staggered collapses, a car driving through) and walk it in
+  first-person (F).
+- **Seamless grid↔packet handoff**: exports now carry the plume's actual
+  momentum (a `kDownsampleMomentum` grid feeds mass-weighted group velocities)
+  at 4³ moment groups (structure, not one dome); promotion crossfades (island
+  fades in while its consumed packets fade out on a render-only list). Islands
+  and packets share ONE detail-noise field (same material-driven world-space
+  scale, same erosion) so the texture is continuous across a handoff.
+- **Renderer scalability**: segmented ray march (per-volume intervals, sorted
+  + clipped, steps allocated with a near-field bias) instead of one union
+  interval; CPU-binned per-screen-tile packet lists (the per-sample loop sees
+  ~a few packets, not all 96); O(N³) directional light sweep replacing the
+  O(N³·steps) per-voxel march (~14× fewer fetches, no per-voxel jitter
+  speckle) with a 16-bit fixed-point transmittance cache (no more banding).
+- **Film-style translucency**: self-shadow marches run at a configurable
+  fraction of the primary extinction ("shadow density", default 0.35), plus
+  soft-knee extinction, ~1.2 m world-space island edge fade, depth-aware
+  upsampling of the half-res volume, and a softened detail response.
+- **Conservation**: packet budget folds overflow into neighbours instead of
+  deleting it; promotion returns un-voxelized packets to the pool; merge
+  blends optics linearly (was cubically biased); emission ownership guarantees
+  a source injects into exactly ONE island; heavily overlapping islands
+  resolve by retiring the less important one.
+- **Working GPU telemetry**: `timestamp-query` resolution was dead on real
+  hardware (a three r180 API move); the quality controller now actually sees
+  GPU ms — check the debug report button.
+
 ## What is implemented (V1)
 
 ### Simulation core — `src/webgpu/`

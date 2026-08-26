@@ -1,12 +1,16 @@
+import { existsSync } from 'node:fs';
 import { defineConfig } from '@playwright/test';
 
 /**
  * Real-browser tests against headless Chromium with WebGPU (SwiftShader).
- * The container pre-installs Chromium at /opt/pw-browsers/chromium; WebGPU
- * needs the Vulkan flags below. Presentation to canvas crashes SwiftShader,
- * so the app runs with present=readback in tests (see src/main.ts).
+ * The dev container pre-installs Chromium at /opt/pw-browsers/chromium; on CI
+ * runners that path doesn't exist and Playwright's own download is used.
+ * WebGPU needs the Vulkan flags below. Presentation to canvas crashes
+ * SwiftShader, so the app runs with present=readback in tests (see src/main.ts).
  */
-const executablePath = process.env.CHROMIUM_PATH ?? '/opt/pw-browsers/chromium';
+const containerChromium = '/opt/pw-browsers/chromium';
+const executablePath =
+  process.env.CHROMIUM_PATH ?? (existsSync(containerChromium) ? containerChromium : undefined);
 
 export default defineConfig({
   testDir: './tests',

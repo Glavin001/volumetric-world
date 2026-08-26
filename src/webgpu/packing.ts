@@ -233,6 +233,8 @@ export interface ActiveEmission {
   scatRate: Vec3;
   phaseWRate: number;
   endTime: number;
+  /** Slot that owns this emission (-1 = packet-represented). Exactly ONE island injects it. */
+  ownerSlot: number;
 }
 
 export function activateEmission(ev: MediumEmissionEvent, material: AerosolMaterial): ActiveEmission {
@@ -245,6 +247,7 @@ export function activateEmission(ev: MediumEmissionEvent, material: AerosolMater
   const loadRate = (ev.fineMassKg * material.artDirection.emissionMultiplier * comp) / (vol * dur);
   const rates = opticalRates(material);
   return {
+    ownerSlot: -1,
     ev,
     material,
     loadRate,

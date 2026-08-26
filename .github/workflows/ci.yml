@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vite build
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser tests (WebGPU on SwiftShader)
+        run: npx playwright test
+        env:
+          PW_WORKERS: '2'
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          retention-days: 7

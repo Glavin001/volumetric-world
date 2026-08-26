@@ -194,7 +194,7 @@ async function boot(): Promise<void> {
     cameraMode = mode;
     if (mode === 'fp') {
       orbit.enabled = false;
-      fp.captureFromCamera(camera);
+      fp.enterGrounded(camera);
       fp.enabled = true;
     } else {
       fp.releaseLock();
@@ -209,7 +209,7 @@ async function boot(): Promise<void> {
   };
   if (cameraMode === 'fp') {
     orbit.enabled = false;
-    fp.captureFromCamera(camera);
+    fp.enterGrounded(camera);
     fp.enabled = true;
     document.body.classList.add('fp-mode');
   }

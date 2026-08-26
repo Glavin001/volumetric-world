@@ -79,6 +79,39 @@ test.describe('first-person camera', () => {
     expect(r.dirShift, 'view direction is preserved on handover').toBeLessThan(0.05);
   });
 
+  test('entering first-person from orbit lands standing on the ground, not floating at orbit altitude', async ({ page }) => {
+    await openScene(page, 'puff');
+    const r = await page.evaluate(() => {
+      const api = (window as any).__vw;
+      // Orbit is an airborne inspection rig — put it up high, well above a
+      // normal eye height, the way auto-orbit or a drag-zoom-out would.
+      api.orbit.snapTo(api.camera, { yawDeg: 40, pitchDeg: 55, dist: 20 });
+      const orbitY = api.camera.position.y;
+      const xBefore = api.camera.position.x;
+      const zBefore = api.camera.position.z;
+
+      api.setCameraMode('fp');
+      return {
+        mode: api.cameraMode,
+        orbitY,
+        eyeHeight: api.fp.eyeHeight,
+        fpY: api.camera.position.y,
+        xShift: Math.abs(api.camera.position.x - xBefore),
+        zShift: Math.abs(api.camera.position.z - zBefore),
+        pitch: api.fp.pitch,
+      };
+    });
+    expect(r.mode).toBe('fp');
+    // Orbit was well above head height; first-person must not inherit that.
+    expect(r.orbitY).toBeGreaterThan(6);
+    expect(r.eyeHeight).toBeCloseTo(1.7, 1);
+    expect(r.fpY).toBeCloseTo(1.7, 1);
+    expect(r.pitch).toBeCloseTo(0, 2); // level, looking at the horizon
+    // Horizontal position (and heading) still carries over — no teleport.
+    expect(r.xShift).toBeLessThan(0.05);
+    expect(r.zShift).toBeLessThan(0.05);
+  });
+
   test('standing inside the plume renders participating media', async ({ page }) => {
     await openScene(page, 'puff', { render: true });
     await step(page, 45);

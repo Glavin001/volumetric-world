@@ -61,6 +61,24 @@ export class FirstPersonCamera {
     this.velocity.set(0, 0, 0);
   }
 
+  /**
+   * Enter walking on the ground: keep the horizontal position and heading the
+   * viewer was just looking from (so the switch still feels continuous), but
+   * drop to a normal walking eye height instead of adopting whatever altitude
+   * the orbit rig happened to be flying at — orbit inspects from the air,
+   * first-person is meant to be a person standing on the ground.
+   */
+  enterGrounded(camera: THREE.PerspectiveCamera, eyeHeightM = 1.7): void {
+    const dir = camera.getWorldDirection(new THREE.Vector3());
+    this.yaw = Math.atan2(-dir.x, -dir.z);
+    this.pitch = 0; // look at the horizon, not wherever the orbit camera was pitched
+    this.eyeHeight = eyeHeightM;
+    this.position.set(camera.position.x, this.groundY + this.eyeHeight, camera.position.z);
+    this.velocity.set(0, 0, 0);
+    this.enabled = true;
+    this.update(0, camera);
+  }
+
   /** Absolute placement for capture scripts and tests. */
   snapTo(
     camera: THREE.PerspectiveCamera,

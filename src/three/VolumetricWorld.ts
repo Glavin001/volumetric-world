@@ -15,7 +15,7 @@ import {
   ActiveEmission, ActiveEffector, WorldPrim, activateEmission, effectorDuration, flattenShape,
   packEffectors, packEvents, packPrims, packPromo, primFromBody, sourceBoundR, sourceCenter,
 } from '../webgpu/packing';
-import { MAX_PROMO } from '../webgpu/uniforms';
+import { MAX_PROMO, configureSweep } from '../webgpu/uniforms';
 import { VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE } from './volumetricPass';
 import { QID } from '../core/math';
 import type { AerosolMaterial, QualityPreset } from '../core/types';
@@ -453,7 +453,10 @@ export class VolumetricWorld {
     (uni.sunDir.value as THREE.Vector3).set(this.sun.dir[0], this.sun.dir[1], this.sun.dir[2]);
 
     const light = this.scheduler.lightDue(island, this.simTime);
-    if (light) island.lastLightAt = this.simTime;
+    if (light) {
+      island.lastLightAt = this.simTime;
+      configureSweep(uni, norm(this.sun.dir), this.preset.slotRes, island.sizeM / this.preset.slotRes);
+    }
     gpu.step({ light, metrics: this.metricsEnabled });
     island.estimatedMassKg *= Math.exp(-material.dissipationPerSecond * dt);
     if (this.metricsEnabled) this.pollDivStats();

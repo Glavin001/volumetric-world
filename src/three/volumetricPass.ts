@@ -389,7 +389,8 @@ export class VolumetricPass {
                   sigT.addAssign(st);
                   sigS.addAssign(st.mul(b.xyz));
                   gW.addAssign(b.w.mul(2.0).sub(1.0).mul(dot(st.mul(b.xyz), vec3(0.2126, 0.7152, 0.0722))));
-                  const sh = texture3D(atlas.texShadow, uvw0, int(0)).x;
+                  const shTex = texture3D(atlas.texShadow, uvw0, int(0));
+                  const sh = min(shTex.x.add(shTex.y.div(255.0)), 1.0); // 16-bit sqrt(T)
                   sunTrans.mulAssign(sh.mul(sh));
                 });
               });
@@ -598,7 +599,8 @@ export class VolumetricPass {
             .and(local.x.lessThan(1.02)).and(local.y.lessThan(1.02)).and(local.z.lessThan(1.02));
           If(inside, () => {
             const uvw = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(N)).div(atlasDims);
-            const sh = texture3D(atlas.texShadow, uvw, int(0)).x;
+            const shTex = texture3D(atlas.texShadow, uvw, int(0));
+            const sh = min(shTex.x.add(shTex.y.div(255.0)), 1.0); // 16-bit sqrt(T)
             shadowF.mulAssign(sh.mul(sh));
           });
         });

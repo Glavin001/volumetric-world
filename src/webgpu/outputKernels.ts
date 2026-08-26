@@ -2,7 +2,7 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, int, uint, uvec3, vec3, vec4,
-  min, max, clamp, exp, sqrt, length, dot, smoothstep, mix,
+  min, max, clamp, exp, sqrt, length, dot, smoothstep, mix, floor, fract, sin,
   instanceIndex, textureStore, texture3D,
 } from 'three/tsl';
 import { GpuField, fieldCoord, fieldIndex } from './fields';
@@ -15,7 +15,7 @@ export interface VolumeAtlas {
   texA: THREE.Storage3DTexture; // σt rgb, loading
   texB: THREE.Storage3DTexture; // albedo rgb, g encoded
   texVel: THREE.Storage3DTexture; // velocity xyz (m/s)
-  texShadow: THREE.Storage3DTexture; // sqrt(sun transmittance)
+  texShadow: THREE.Storage3DTexture; // sqrt(sun transmittance), 16-bit fixed point in (x=hi, y=lo/255)
   dimX: number;
   dimY: number;
   dimZ: number;
@@ -82,7 +82,12 @@ export function initAtlasTextures(renderer: THREE.WebGPURenderer, atlas: VolumeA
   upload(atlas.texA, 8, () => {});
   upload(atlas.texVel, 8, () => {});
   upload(atlas.texB, 4, (b) => b.fill(0x80));
-  upload(atlas.texShadow, 4, (b) => b.fill(0xff));
+  // sqrt(T)=1 in 16-bit fixed point: hi=0xff, lo=0 (lo=0xff would decode >1).
+  upload(atlas.texShadow, 4, (b) => {
+    for (let i = 0; i < b.length; i += 4) {
+      b[i] = 0xff; b[i + 1] = 0; b[i + 2] = 0; b[i + 3] = 0xff;
+    }
+  });
 }
 
 /** Extinction soft-knee (1/m): sigma compresses toward this instead of clamping. */
@@ -178,9 +183,93 @@ export function kLightMarch(f: IslandFields, uni: IslandUniforms, atlas: VolumeA
         uint(y.add(int(uni.slotOffsetVox.y))),
         uint(z.add(int(uni.slotOffsetVox.z))),
       );
-      textureStore(atlas.texShadow, texel, vec4(sqrt(trans), 0.0, 0.0, 1.0)).toWriteOnly();
+      // 16-bit fixed-point sqrt(T) across two 8-bit channels (x=hi, y=lo):
+      // 8 bits alone band visibly on smooth domes. e = hi + lo/255 is linear,
+      // so hardware trilinear filtering reconstructs it exactly.
+      const enc = sqrt(trans).mul(255.0);
+      textureStore(atlas.texShadow, texel, vec4(floor(enc).div(255.0), fract(enc), 0.0, 1.0)).toWriteOnly();
     });
   })().compute(cells);
+}
+
+/**
+ * O(N³) directional light sweep replacing the O(N³·lightSteps) per-voxel
+ * march: one thread per launch column on a 2N×2N grid (covering worst-case
+ * 45° shear), each walking N layers along the dominant sun axis, accumulating
+ * optical depth once per layer and storing sqrt(T). Per-layer column drift is
+ * identical across threads, so each layer's writes are a shifted bijection of
+ * the launch grid — full coverage, no races, no barriers, and no per-voxel
+ * jitter speckle (a per-COLUMN entry jitter decorrelates banding instead).
+ */
+export function kLightSweep(f: IslandFields, uni: IslandUniforms, atlas: VolumeAtlas): any {
+  const N = f.N;
+  const W = 2 * N;
+  const threads = W * W;
+  const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(threads)), () => {
+      const idx = int(instanceIndex).toVar();
+      const tb = idx.div(int(W)).toVar();
+      const ta = idx.sub(tb.mul(int(W))).toVar();
+      const a0 = float(ta).add(uni.sweepBase.x).toVar();
+      const b0 = float(tb).add(uni.sweepBase.y).toVar();
+
+      const da = uni.sweepParams.x;
+      const db = uni.sweepParams.y;
+      const L0 = uni.sweepParams.z;
+      const dL = uni.sweepParams.w;
+      const stepOd = uni.sweepStepLen.mul(uni.shadowDensity).toVar();
+
+      // Per-column entry jitter breaks residual layer banding without the
+      // per-voxel speckle the old march produced.
+      const jit = fract(sin(float(ta).mul(127.1).add(float(tb).mul(311.7))).mul(43758.5453)).mul(0.5).toVar();
+
+      const od = float(0).toVar();
+      Loop({ start: int(0), end: int(N), type: 'int', condition: '<' }, ({ i }: any) => {
+        const fi = float(i).toVar();
+        const layer = L0.add(dL.mul(fi)).toVar();
+        // Continuous sample position (voxel space) along the true sun ray.
+        const ac = a0.add(da.mul(fi.add(jit))).add(0.5);
+        const bc = b0.add(db.mul(fi.add(jit))).add(0.5);
+        const vox = uni.sweepAxisA.mul(ac)
+          .add(uni.sweepAxisL.mul(layer.add(0.5)))
+          .add(uni.sweepAxisB.mul(bc)).toVar();
+        const local = vox.div(float(N)).toVar();
+        const inside = local.x.greaterThanEqual(0.0).and(local.y.greaterThanEqual(0.0)).and(local.z.greaterThanEqual(0.0))
+          .and(local.x.lessThan(1.0)).and(local.y.lessThan(1.0)).and(local.z.lessThan(1.0));
+
+        const sigLum = float(0).toVar();
+        If(inside.and(od.lessThan(14.0)), () => {
+          const lc = clamp(local, vec3(0.002), vec3(0.998));
+          const uvw = uni.slotOffsetVox.add(lc.mul(float(N))).div(atlasDims);
+          const sig = texture3D(atlas.texA, uvw, int(0)).xyz;
+          sigLum.assign(dot(sig, vec3(0.2126, 0.7152, 0.0722)));
+        });
+
+        // Half-step self attenuation: write T at the voxel centre.
+        od.addAssign(sigLum.mul(stepOd).mul(0.5));
+        // Quantized output column for this layer (same drift for all threads —
+        // a bijection of the launch grid, so every slot texel is written once).
+        const oa = a0.add(floor(da.mul(fi).add(0.5))).toVar();
+        const ob = b0.add(floor(db.mul(fi).add(0.5))).toVar();
+        const outVox = uni.sweepAxisA.mul(oa)
+          .add(uni.sweepAxisL.mul(layer))
+          .add(uni.sweepAxisB.mul(ob)).toVar();
+        const inRange = outVox.x.greaterThanEqual(0.0).and(outVox.y.greaterThanEqual(0.0)).and(outVox.z.greaterThanEqual(0.0))
+          .and(outVox.x.lessThan(float(N))).and(outVox.y.lessThan(float(N))).and(outVox.z.lessThan(float(N)));
+        If(inRange, () => {
+          const texel = uvec3(
+            uint(int(outVox.x).add(int(uni.slotOffsetVox.x))),
+            uint(int(outVox.y).add(int(uni.slotOffsetVox.y))),
+            uint(int(outVox.z).add(int(uni.slotOffsetVox.z))),
+          );
+          const enc = sqrt(exp(od.negate())).mul(255.0);
+          textureStore(atlas.texShadow, texel, vec4(floor(enc).div(255.0), fract(enc), 0.0, 1.0)).toWriteOnly();
+        });
+        od.addAssign(sigLum.mul(stepOd).mul(0.5));
+      });
+    });
+  })().compute(threads);
 }
 
 /** Zero a whole atlas slot (on island spawn/free) — shadow initialized to 1. */
@@ -198,7 +287,7 @@ export function kClearVolumeSlot(N: number, uni: IslandUniforms, atlas: VolumeAt
       textureStore(atlas.texA, texel, vec4(0.0)).toWriteOnly();
       textureStore(atlas.texB, texel, vec4(0.5)).toWriteOnly();
       textureStore(atlas.texVel, texel, vec4(0.0)).toWriteOnly();
-      textureStore(atlas.texShadow, texel, vec4(1.0)).toWriteOnly();
+      textureStore(atlas.texShadow, texel, vec4(1.0, 0.0, 0.0, 1.0)).toWriteOnly();
     });
   })().compute(cells);
 }

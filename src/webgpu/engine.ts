@@ -11,7 +11,7 @@ import {
 } from './solverKernels';
 import {
   VolumeAtlas, createAtlas, slotOffsetVox, initAtlasTextures, COARSE,
-  kWriteVolume, kLightMarch, kClearVolumeSlot, kDownsampleMass, kDownsampleMomentum, kDownsampleAbsDiv,
+  kWriteVolume, kLightMarch, kLightSweep, kClearVolumeSlot, kDownsampleMass, kDownsampleMomentum, kDownsampleAbsDiv,
   kClearShell, kShift, kCopy, kPacketDensity, kPacketVelocity,
 } from './outputKernels';
 
@@ -75,7 +75,11 @@ export class IslandGPU {
       sumMassPre: kSumCoarseMass(s.coarseMass, s.massStat, 0),
       sumMassPost: kSumCoarseMass(s.coarseMass, s.massStat, 1),
       writeVolume: kWriteVolume(f, s, uni, atlas),
-      light: kLightMarch(f, uni, atlas, preset.lightSteps),
+      // O(N³) sliced sweep is the default; ?lightpath=march keeps the legacy
+      // per-voxel march for A/B comparison and the CI equivalence test.
+      light: IslandGPU.useLegacyLightMarch()
+        ? kLightMarch(f, uni, atlas, preset.lightSteps)
+        : kLightSweep(f, uni, atlas),
       clearSlot: kClearVolumeSlot(this.N, uni, atlas),
       downMass: kDownsampleMass(f, s, uni),
       downMom: kDownsampleMomentum(f, s, uni),
@@ -174,6 +178,11 @@ export class IslandGPU {
     r.compute(k.densCommit);
     r.compute(k.writeVolume);
     if (flags.light) r.compute(k.light);
+  }
+
+  static useLegacyLightMarch(): boolean {
+    return typeof location !== 'undefined' &&
+      new URLSearchParams(location.search).get('lightpath') === 'march';
   }
 
   computeMassGrid(): void {

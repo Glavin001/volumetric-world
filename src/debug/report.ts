@@ -51,6 +51,7 @@ export async function buildDebugReport(
     presetName: string;
     perf: PerfRing;
     frameDataUrl?: string;
+    camera?: Record<string, unknown>;
   },
 ): Promise<Record<string, unknown>> {
   let adapterDetail: Record<string, unknown> = {};
@@ -101,6 +102,7 @@ export async function buildDebugReport(
     canvasSize: [world.renderer.domElement?.width, world.renderer.domElement?.height],
     threeRevision: THREE.REVISION,
     scene: extra.sceneId,
+    camera: extra.camera ?? null,
     preset: { ...world.preset, presetKey: extra.presetName },
     gpu: { info: world.gpuInfo, softwareAdapter: world.softwareAdapter, ...adapterDetail },
     engine: {

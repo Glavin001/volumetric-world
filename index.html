@@ -19,6 +19,18 @@
         transition: opacity 1.2s ease; line-height: 1.5; text-align: right;
       }
       #cam-hint.faded { opacity: 0; }
+      /* First person: the pointer is the aim, so show a crosshair instead of a grab hand. */
+      body.fp-mode #view { cursor: crosshair; }
+      body.fp-mode #crosshair { display: block; }
+      #crosshair {
+        display: none; position: fixed; left: 50%; top: 50%; z-index: 5; width: 14px; height: 14px;
+        margin: -7px 0 0 -7px; pointer-events: none; opacity: 0.55;
+      }
+      #crosshair::before, #crosshair::after {
+        content: ''; position: absolute; background: #eef3fa;
+      }
+      #crosshair::before { left: 6px; top: 0; width: 2px; height: 14px; }
+      #crosshair::after { left: 0; top: 6px; width: 14px; height: 2px; }
       #vw-stats {
         position: fixed; left: 10px; top: 10px; color: #dfe7f0; font-size: 11px; line-height: 1.45;
         background: rgba(10, 14, 20, 0.55); padding: 8px 10px; border-radius: 6px; white-space: pre;
@@ -49,7 +61,8 @@
     <canvas id="view"></canvas>
     <div id="loading">initializing WebGPU volumetric engine…</div>
     <div id="nav"></div>
-    <div id="cam-hint">drag to orbit · scroll / pinch to zoom · right-drag or 2-finger to pan<br />space: auto-orbit · R: reset · WASD/QE: move pivot</div>
+    <div id="crosshair"></div>
+    <div id="cam-hint">drag to orbit · scroll / pinch to zoom · right-drag or 2-finger to pan<br />space: auto-orbit · R: reset · WASD/QE: move pivot<br /><b>F: first-person</b> — then WASD walk, drag/mouse look, Q/E height, shift run</div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

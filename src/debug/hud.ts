@@ -2,6 +2,7 @@ import GUI from 'lil-gui';
 import type { VolumetricWorld } from '../three/VolumetricWorld';
 import type { EnvCtx } from '../demo/environment';
 import type { OrbitCamera } from '../demo/orbitCamera';
+import type { FirstPersonCamera } from '../demo/firstPerson';
 import { setSunAngles } from '../demo/environment';
 import { SCENES } from '../demo/scenes';
 import { PRESETS } from '../core/presets';
@@ -9,6 +10,7 @@ import { PRESETS } from '../core/presets';
 /** Stats overlay + tuning panel. */
 export class Hud {
   private statsEl: HTMLDivElement;
+  private cameraModes?: { get: () => 'orbit' | 'fp'; set: (m: 'orbit' | 'fp') => void; fp: FirstPersonCamera };
   private gui: GUI;
   private frames = 0;
   private lastFpsAt = performance.now();
@@ -32,6 +34,11 @@ export class Hud {
     sceneId: string,
     presetName: string,
     onDownloadReport?: () => Promise<void>,
+    cameraModes?: {
+      get: () => 'orbit' | 'fp';
+      set: (m: 'orbit' | 'fp') => void;
+      fp: FirstPersonCamera;
+    },
   ) {
     this.statsEl = document.createElement('div');
     this.statsEl.id = 'vw-stats';
@@ -48,6 +55,15 @@ export class Hud {
       .add({ preset: presetName }, 'preset', Object.keys(PRESETS))
       .onChange((v: string) => this.reload({ preset: v }));
     const cam = this.gui.addFolder('camera');
+    if (cameraModes) {
+      this.cameraModes = cameraModes;
+      cam
+        .add({ mode: cameraModes.get() }, 'mode', ['orbit', 'fp'])
+        .name('mode (F)')
+        .onChange((v: 'orbit' | 'fp') => cameraModes.set(v))
+        .listen();
+      cam.add(cameraModes.fp, 'walkSpeed', 1, 14, 0.2).name('walk speed (m/s)');
+    }
     cam.add(orbit, 'autoOrbit').name('auto-orbit (space)');
     cam.add(orbit, 'autoSpeed', -0.6, 0.6, 0.01).name('orbit speed');
     cam.add({ reset: () => orbit.reset() }, 'reset').name('reset view (R)');
@@ -119,7 +135,9 @@ export class Hud {
         .join('\n');
       this.statsEl.textContent =
         `${this.fps.toFixed(0)} fps | sim ${w.simTime.toFixed(1)}s | gpu ${w.scheduler.gpuMsAverage.toFixed(2)}ms | q=${w.scheduler.qualityScale.toFixed(2)}\n` +
-        `cam ${this.orbit.orbitDistance.toFixed(1)}m${this.orbit.autoOrbit ? ' · auto-orbit' : ''}\n` +
+        (this.cameraModes?.get() === 'fp'
+          ? `cam first-person · eye ${this.cameraModes.fp.eyeHeight.toFixed(1)}m · WASD move\n`
+          : `cam ${this.orbit.orbitDistance.toFixed(1)}m${this.orbit.autoOrbit ? ' · auto-orbit' : ''}\n`) +
         `islands ${w.scheduler.activeIslands().length}/${w.preset.slots}\n${islands}\n` +
         `packets ${w.packets.packets.length} (~${w.packets.totalMass().toFixed(0)}kg)`;
     }

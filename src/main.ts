@@ -1,11 +1,13 @@
 import * as THREE from 'three/webgpu';
 import { VolumetricWorld, type WorldMetrics } from './three/VolumetricWorld';
+import { resolvePreset } from './core/presets';
 import { buildEnvironment } from './demo/environment';
 import { SCENES, sceneById, type SceneCtx } from './demo/scenes';
 import { Hud } from './debug/hud';
 import { Diag } from './debug/diag';
 import { PerfRing, buildDebugReport, downloadReport } from './debug/report';
 import { OrbitCamera } from './demo/orbitCamera';
+import { FirstPersonCamera } from './demo/firstPerson';
 import type { Vec3 } from './core/types';
 
 declare global {
@@ -31,8 +33,15 @@ interface TestApi {
   setDebugMode(m: number): void;
   /** Orbit-camera controller (inspection + scripted capture angles). */
   orbit: OrbitCamera;
+  /** First-person controller (walk-through perspective). */
+  fp: FirstPersonCamera;
+  /** 'orbit' inspects from outside; 'fp' walks through the scene. */
+  cameraMode: 'orbit' | 'fp';
+  setCameraMode(mode: 'orbit' | 'fp'): void;
   /** Jump to an absolute orbit view; angles in degrees, distance in meters. */
   setView(view: { yawDeg?: number; pitchDeg?: number; dist?: number; target?: Vec3 }): void;
+  /** Freeze/unfreeze the simulation while leaving the camera live. */
+  setPaused(v: boolean): void;
   /** Build the same debug report the HUD button downloads (without saving). */
   debugReport(): Promise<Record<string, unknown>>;
   /** Exactly what the HUD button does: build the report and auto-download it. */
@@ -95,8 +104,14 @@ async function boot(): Promise<void> {
     await bootSafe(canvas);
     return;
   }
+  // ?temporal=0|1 forces the temporal accumulator on/off regardless of preset,
+  // so CI (whose 'test' preset disables it) can still exercise that path.
+  const temporalParam = params.get('temporal');
+  const preset = temporalParam === null
+    ? resolvePreset(presetName)
+    : { ...resolvePreset(presetName), temporal: temporalParam === '1' };
   const world = await VolumetricWorld.create(canvas, {
-    preset: presetName,
+    preset,
     metrics: autoMetrics,
     seed: Number(params.get('seed') ?? 7),
   });
@@ -121,8 +136,18 @@ async function boot(): Promise<void> {
     document.body.appendChild(shot);
     ctx2d = shot.getContext('2d');
   }
+  // One blit in flight at a time: the RAF loop must never queue readbacks
+  // faster than the GPU retires them, or the presented image falls further and
+  // further behind the live camera (unbounded backlog, frozen-looking canvas).
+  let blitBusy = false;
   const present = async (): Promise<void> => {
-    if (ctx2d) await world.pass.blitToCanvas2D(ctx2d);
+    if (!ctx2d || blitBusy) return;
+    blitBusy = true;
+    try {
+      await world.pass.blitToCanvas2D(ctx2d);
+    } finally {
+      blitBusy = false;
+    }
   };
 
   const resize = (): void => {
@@ -160,10 +185,52 @@ async function boot(): Promise<void> {
     window.setTimeout(() => document.getElementById('cam-hint')?.classList.add('faded'), 9000);
   }
 
+  // Opt-in walk-through rig. Only one controller drives the camera at a time;
+  // each adopts the other's pose on switch so the view never jumps.
+  const fp = new FirstPersonCamera({ groundY: world.groundY });
+  let cameraMode: 'orbit' | 'fp' = params.get('fp') === '1' ? 'fp' : 'orbit';
+  const setCameraMode = (mode: 'orbit' | 'fp'): void => {
+    if (mode === cameraMode) return;
+    cameraMode = mode;
+    if (mode === 'fp') {
+      orbit.enabled = false;
+      fp.captureFromCamera(camera);
+      fp.enabled = true;
+    } else {
+      fp.releaseLock();
+      fp.enabled = false;
+      // Pivot around whatever the walker was looking at, ~8 m ahead.
+      const ahead = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(8).add(camera.position);
+      ahead.y = Math.max(ahead.y, world.groundY + 0.5);
+      orbit.enabled = true;
+      orbit.captureFromCamera(camera, ahead);
+    }
+    document.body.classList.toggle('fp-mode', mode === 'fp');
+  };
+  if (cameraMode === 'fp') {
+    orbit.enabled = false;
+    fp.captureFromCamera(camera);
+    fp.enabled = true;
+    document.body.classList.add('fp-mode');
+  }
+  if (!testMode) {
+    fp.attach(canvas);
+    fp.onEngage = () => {
+      ctx.state.userCamera = true;
+      document.getElementById('cam-hint')?.classList.add('faded');
+    };
+    window.addEventListener('keydown', (e) => {
+      if (e.target instanceof HTMLInputElement) return;
+      if (e.key.toLowerCase() === 'f') setCameraMode(cameraMode === 'fp' ? 'orbit' : 'fp');
+    });
+  }
+
   world.setCamera(camera);
   camera.updateMatrixWorld();
 
   let sceneTime = 0;
+  // Pause driven from the test API; OR-ed with the HUD's own toggle below.
+  let apiPaused = false;
 
   const perf = new PerfRing();
   const makeReport = async (): Promise<Record<string, unknown>> => {
@@ -175,7 +242,18 @@ async function boot(): Promise<void> {
     } catch (e) {
       diag.log('report', `frame capture failed: ${String(e)}`);
     }
-    return buildDebugReport(world, diag, { sceneId, presetName, perf, frameDataUrl });
+    return buildDebugReport(world, diag, {
+      sceneId, presetName, perf, frameDataUrl,
+      camera: {
+        mode: cameraMode,
+        position: camera.position.toArray().map((v) => +v.toFixed(2)),
+        forward: camera.getWorldDirection(new THREE.Vector3()).toArray().map((v) => +v.toFixed(3)),
+        fov: camera.fov,
+        orbitDistance: +orbit.orbitDistance.toFixed(2),
+        autoOrbit: orbit.autoOrbit,
+        eyeHeightM: +fp.eyeHeight.toFixed(2),
+      },
+    });
   };
   const downloadDebugReport = async (): Promise<void> => downloadReport(await makeReport(), sceneId);
 
@@ -239,10 +317,18 @@ async function boot(): Promise<void> {
       (world.pass.debugMode as { value: number }).value = m;
     },
     orbit,
+    fp,
+    get cameraMode() {
+      return cameraMode;
+    },
+    setCameraMode,
     setView(view) {
       orbit.snapTo(camera, view);
       camera.updateMatrixWorld();
       world.setCamera(camera);
+    },
+    setPaused(v: boolean) {
+      apiPaused = v;
     },
     debugReport: makeReport,
     downloadDebugReport,
@@ -261,23 +347,29 @@ async function boot(): Promise<void> {
     return;
   }
 
-  const hud = new Hud(world, env, orbit, sceneId, presetName, downloadDebugReport);
+  const hud = new Hud(world, env, orbit, sceneId, presetName, downloadDebugReport, {
+    get: () => cameraMode,
+    set: setCameraMode,
+    fp,
+  });
   let last = performance.now();
   const loop = (): void => {
     requestAnimationFrame(loop);
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
-    if (!hud.paused) {
+    const paused = hud.paused || apiPaused;
+    if (!paused) {
       sceneTime += dt;
       def.tick?.(ctx, dt, sceneTime);
     }
-    // The camera keeps orbiting even while the sim is paused, so a frozen
-    // moment can be inspected from every side.
-    orbit.update(dt, camera);
+    // The camera keeps moving even while the sim is paused, so a frozen moment
+    // can be inspected from every side (or walked around).
+    if (cameraMode === 'fp') fp.update(dt, camera);
+    else orbit.update(dt, camera);
     camera.updateMatrixWorld();
     const t0 = performance.now();
-    if (!hud.paused) world.update(dt, camera);
+    if (!paused) world.update(dt, camera);
     else world.setCamera(camera);
     const t1 = performance.now();
     world.render(scene, camera);

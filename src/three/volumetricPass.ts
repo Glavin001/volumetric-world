@@ -171,9 +171,12 @@ export class VolumetricPass {
     // used for color sampling (texel = uv·size, no flip — same rasterization).
     const pxf = clamp(uvNode.mul(this.fullSize), vec2(0.0), this.fullSize.sub(1.0));
     const depth = float(textureLoad(this.sceneRT.depthTexture as THREE.DepthTexture, ivec2(pxf))).toVar();
-    // WebGPU NDC: x,y in [-1,1], z in [0,1] equals the stored depth. The y
-    // orientation of quad-uv vs NDC is verified empirically via debugMode=1.
-    const ndc = vec4(uvNode.x.mul(2).sub(1), uvNode.y.mul(2).sub(1), depth, 1.0);
+    // WebGPU NDC: x,y in [-1,1], z in [0,1] equals the stored depth. The
+    // fullscreen quad's v runs top-to-bottom (v=0 is the TOP row — verify with
+    // debugMode=9), so NDC y must be flipped. Getting this wrong mirrors every
+    // volumetric ray about the view axis: ground dust marches into the sky and
+    // the volume swings opposite to the world as the camera moves.
+    const ndc = vec4(uvNode.x.mul(2).sub(1), float(1).sub(uvNode.y.mul(2)), depth, 1.0);
     const viewP = this.camProjInv.mul(ndc).toVar();
     const view3 = viewP.xyz.div(viewP.w).toVar();
     const world = this.camWorld.mul(vec4(view3, 1.0)).xyz.toVar();
@@ -246,7 +249,7 @@ export class VolumetricPass {
       const opaqueDist = length(opaqueWorld.sub(this.camPos)).toVar();
 
       // Camera ray through this pixel (far-plane reconstruction shares conventions).
-      const ndcFar = vec4(uvN.x.mul(2).sub(1), uvN.y.mul(2).sub(1), 1.0, 1.0);
+      const ndcFar = vec4(uvN.x.mul(2).sub(1), float(1).sub(uvN.y.mul(2)), 1.0, 1.0);
       const vpFar = this.camProjInv.mul(ndcFar).toVar();
       const farWorld = this.camWorld.mul(vec4(vpFar.xyz.div(vpFar.w), 1.0)).xyz;
       const rayDir = normalize(farWorld.sub(this.camPos)).toVar();
@@ -483,7 +486,7 @@ export class VolumetricPass {
             const wp = this.camPos.add(rayDir.mul(tRep));
             const clip = this.prevViewProj.mul(vec4(wp, 1.0)).toVar();
             const pndc = clip.xyz.div(max(clip.w, 1e-5)).toVar();
-            const puv = vec2(pndc.x.mul(0.5).add(0.5), pndc.y.mul(0.5).add(0.5)).toVar();
+            const puv = vec2(pndc.x.mul(0.5).add(0.5), float(0.5).sub(pndc.y.mul(0.5))).toVar();
             const validUv = puv.x.greaterThan(0.001).and(puv.x.lessThan(0.999))
               .and(puv.y.greaterThan(0.001)).and(puv.y.lessThan(0.999)).and(clip.w.greaterThan(0.0));
             If(validUv, () => {
@@ -511,6 +514,12 @@ export class VolumetricPass {
         }).Else(() => {
           outCol.assign(vec4(a1.x.mul(-0.05), a1.z.mul(-0.05), a1.w.mul(0.05), 1.0));
         });
+      });
+      // Debug: raw quad uv (r=u, g=v) — pins the v orientation of the
+      // fullscreen quad against the rasteriser, which the ray generation and
+      // the depth reconstruction both depend on.
+      If(this.debugMode.equal(9), () => {
+        outCol.assign(vec4(uvN.x, uvN.y, 0.0, 1.0));
       });
       // Debug: raw atlas mid-slice (all slots side by side).
       If(this.debugMode.equal(6), () => {

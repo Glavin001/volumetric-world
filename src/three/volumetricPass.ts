@@ -48,7 +48,6 @@ export class VolumetricPass {
   exposure = uniform(0.62);
   raySteps = uniform(64);
   detailStrength = uniform(0.75);
-  detailScale = uniform(1.4);
   timeS = uniform(0);
   frameIdx = uniform(0);
   historyBlend = uniform(0.82);
@@ -235,6 +234,22 @@ export class VolumetricPass {
     return n1.add(n2).mul(0.666); // ≈ [-1, 1]
   }
 
+  /**
+   * Shared sub-grid detail modulation for BOTH islands and packets: the same
+   * fbm response and the same σt-driven edge erosion, so a plume keeps an
+   * identical surface texture across the grid↔packet handoff.
+   */
+  private detailModulate(n01: any, sigLum: any) {
+    const edge = smoothstep(1.2, 0.05, sigLum);
+    return clamp(
+      n01.mul(this.detailStrength).mul(1.8)
+        .add(float(1.0).sub(this.detailStrength.mul(0.72)))
+        .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
+      0.0,
+      2.1,
+    );
+  }
+
   private buildRaymarch(temporal: boolean): any {
     const atlas = this.atlas;
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
@@ -356,17 +371,14 @@ export class VolumetricPass {
                   // (skipped entirely when detail is disabled — software adapters).
                   const m = float(1.0).toVar();
                   If(this.detailStrength.greaterThan(0.01), () => {
-                    const nPos = p2.div(this.detailScale).add(vec3(float(s).mul(7.31))).toVar();
+                    // World-space noise at the material's detail scale (m2.w),
+                    // with NO per-slot phase offset — the offset guaranteed a
+                    // visible texture jump at every retire/promote handoff and
+                    // across island boundaries.
+                    const nPos = p2.div(max(m2.w, 0.3)).toVar();
                     const n01 = this.fbm(nPos).mul(0.5).add(0.5).toVar();
                     const sLum0 = dot(a.xyz, vec3(0.2126, 0.7152, 0.0722)).toVar();
-                    const edge = smoothstep(1.2, 0.05, sLum0).toVar();
-                    m.assign(clamp(
-                      n01.mul(this.detailStrength).mul(1.9)
-                        .add(float(1.0).sub(this.detailStrength.mul(0.75)))
-                        .sub(edge.mul(this.detailStrength).mul(n01.oneMinus()).mul(1.1)),
-                      0.0,
-                      2.2,
-                    ));
+                    m.assign(this.detailModulate(n01, sLum0));
                   });
                   const st = a.xyz.mul(m).mul(m2.y).toVar();
                   sigT.addAssign(st);
@@ -393,14 +405,14 @@ export class VolumetricPass {
               const gaus = exp(q.mul(-0.5)).mul(r0.w).toVar();
               const m = float(1.0).toVar();
               If(this.detailStrength.greaterThan(0.01), () => {
-                const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).add(r4.w).toVar();
+                // Same world-space noise field as islands (no per-packet seed):
+                // at spawn (age 0) this equals the island path's advected
+                // position, so the texture is continuous through a handoff and
+                // between neighbouring packets, then advects with the packet.
+                const pd = p.sub(r4.xyz.mul(r3.w)).div(max(r2.w, 0.3)).toVar();
                 const n01 = this.fbm(pd).mul(0.5).add(0.5);
-                m.assign(clamp(
-                  n01.mul(this.detailStrength).mul(1.7).add(float(1.0).sub(this.detailStrength.mul(0.7)))
-                    .sub(smoothstep(0.6, 0.05, gaus.mul(dot(r2.xyz, vec3(1.0)))).mul(this.detailStrength).mul(n01.oneMinus())),
-                  0.0,
-                  2.0,
-                ));
+                const sigLum = gaus.mul(dot(r2.xyz, vec3(0.2126, 0.7152, 0.0722)));
+                m.assign(this.detailModulate(n01, sigLum));
               });
               const st = r2.xyz.mul(gaus).mul(m).toVar();
               sigT.addAssign(st);

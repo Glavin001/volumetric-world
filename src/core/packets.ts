@@ -106,7 +106,9 @@ export class PacketSystem {
       ageSeconds: 0,
       seed,
       fade,
-      detailScaleM: material.detail.baseScaleM * 1.6,
+      // Same world-space detail scale the island render path uses (meta m2.w):
+      // any fudge factor here would desynchronize the noise across a handoff.
+      detailScaleM: material.detail.baseScaleM,
     });
   }
 

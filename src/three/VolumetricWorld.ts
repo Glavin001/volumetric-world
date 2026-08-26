@@ -722,7 +722,11 @@ export class VolumetricWorld {
       const so = gpu.uni.slotOffsetVox.value as THREE.Vector3;
       meta[b + 0].set(island.origin[0], island.origin[1], island.origin[2], island.sizeM);
       meta[b + 1].set(so.x, so.y, so.z, active ? 1 : 0);
-      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, 0, 0);
+      // m2.zw: (reserved for slot res), material detail scale — the same
+      // world-space noise scale the packets carry, so both representations
+      // sample one continuous detail field.
+      const detailScaleM = this.islandMaterial.get(island.slot)?.detail.baseScaleM ?? 1.4;
+      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, 0, detailScaleM);
       if (active) count++;
     }
     (pass.islandCount as any).value = count;

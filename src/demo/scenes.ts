@@ -114,13 +114,23 @@ export const SCENES: SceneDef[] = [
       ctx.world.emit({
         eventId: nextEvent(),
         simulationTimeS: ctx.world.simTime,
-        durationS: 5.0,
+        durationS: 6.0,
         substanceId: 'cold-aerosol',
         materialId: 'concrete',
-        source: { kind: 'capsule', startM: [-2.6, 0.6, 0], endM: [-2.6, 2.1, 0], radiusM: 0.9 },
-        fineMassKg: 150,
-        momentum: { kind: 'uniform', initialVelocityMps: [6.5, 0.4, 0] },
+        source: { kind: 'capsule', startM: [-2.6, 0.7, 0], endM: [-2.6, 2.2, 0], radiusM: 1.0 },
+        fineMassKg: 70,
+        momentum: { kind: 'uniform', initialVelocityMps: [8, 0.5, 0] },
         seed: 5,
+      });
+      // Sustained fan keeps the flow attached so the split around the
+      // obstacles stays visible (user-land FlowEffector API).
+      ctx.world.addEffector({
+        kind: 'jet',
+        startM: [-3.4, 1.4, 0],
+        direction: [1, 0.02, 0],
+        radiusM: 1.25,
+        speedMps: 7,
+        durationS: 6,
       });
     },
   },

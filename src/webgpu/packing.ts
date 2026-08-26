@@ -238,8 +238,11 @@ export interface ActiveEmission {
 export function activateEmission(ev: MediumEmissionEvent, material: AerosolMaterial): ActiveEmission {
   const vol = Math.max(sourceVolumeM3(ev.source), 0.05);
   const dur = Math.max(ev.durationS, 1 / 60);
-  // Profile integral over the source is < volume (soft edges) — compensate ~1.35×.
-  const loadRate = (ev.fineMassKg * material.artDirection.emissionMultiplier * 1.35) / (vol * dur);
+  // The soft-edged emission profile integrates to less than the source volume;
+  // compensate per shape so fineMassKg lands in the field (sphere smoothstep
+  // 1→0.55 ≈ 0.36·V, box 1→0.75 ≈ 0.63·V, capsule ≈ 0.45·V).
+  const comp = ev.source.kind === 'sphere' ? 2.1 : ev.source.kind === 'box' ? 1.5 : 1.9;
+  const loadRate = (ev.fineMassKg * material.artDirection.emissionMultiplier * comp) / (vol * dur);
   const rates = opticalRates(material);
   return {
     ev,

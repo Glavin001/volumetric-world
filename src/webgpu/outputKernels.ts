@@ -197,8 +197,9 @@ export function kClearVolumeSlot(N: number, uni: IslandUniforms, atlas: VolumeAt
  * Downsample loading into a COARSE³ grid of (mass kg, Σm·x, Σm·y, Σm·z) with
  * island-local positions in meters — used for metrics, export, and tests.
  */
-export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUniforms): any {
+export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUniforms, src?: GpuField): any {
   const N = f.N;
+  const source = src ?? f.dA;
   const block = N / COARSE;
   if (!Number.isInteger(block)) throw new Error(`slotRes ${N} not divisible by ${COARSE}`);
   const coarseCells = COARSE * COARSE * COARSE;
@@ -213,7 +214,7 @@ export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUn
             const cx = x.mul(int(block)).add(k).toVar();
             const cy = y.mul(int(block)).add(j).toVar();
             const cz = z.mul(int(block)).add(i).toVar();
-            const m = f.dA.node.element(fieldIndex(f.dA, cx, cy, cz)).w.mul(cellVol).toVar();
+            const m = source.node.element(fieldIndex(f.dA, cx, cy, cz)).w.mul(cellVol).toVar();
             const px = float(cx).add(0.5).mul(uni.h);
             const py = float(cy).add(0.5).mul(uni.h);
             const pz = float(cz).add(0.5).mul(uni.h);

@@ -39,6 +39,8 @@ export interface ScratchFields {
   coarseMass: GpuField;
   coarseDivPre: GpuField;
   coarseDivPost: GpuField;
+  /** vec4[1]: x = pre-advection mass, y = post-advection mass (renormalization). */
+  massStat: GpuField;
 }
 
 type Uni = IslandUniforms;
@@ -417,9 +419,10 @@ export function kForces(f: IslandFields, s: ScratchFields, uni: Uni, comp: 0 | 1
       const idxP = fieldIndex(f.dA, xp, yp, zp).toVar();
 
       if (comp === 1) {
-        // Cold-dust density loading: f = −g·k·ρ_dust (ŷ). loading is kg/m³.
+        // Cold-dust density loading: f = −g·k·ρ_dust (ŷ). loading is kg/m³;
+        // capped near 2× air density so extreme sources stay integrable.
         const load = f.dA.node.element(idxM).w.add(f.dA.node.element(idxP).w).mul(0.5);
-        const accel = min(load.div(RHO_AIR), 6.0).mul(GRAVITY).mul(uni.buoyK);
+        const accel = min(load.div(RHO_AIR), 2.2).mul(GRAVITY).mul(uni.buoyK);
         vel.subAssign(accel.mul(uni.dt));
       }
 
@@ -660,11 +663,15 @@ export function kDensityCorrect(f: IslandFields, s: ScratchFields, uni: Uni): an
 
       const nbA = neighborhoodMinMax(f.dA, lat);
       const nbB = neighborhoodMinMax(f.dB, lat);
-      corrA.assign(clamp(corrA, nbA.lo, nbA.hi));
+      corrA.assign(max(clamp(corrA, nbA.lo, nbA.hi), vec4(0.0)));
       corrB.assign(clamp(corrB, nbB.lo, nbB.hi));
 
-      corrA.assign(max(corrA.mul(uni.dissFactor), vec4(0.0)));
-      corrB.assign(corrB.mul(uni.dissFactor));
+      // Solids hold no aerosol: advection must not soak dust into walls/ground.
+      // The commit renormalization redistributes this mass back into the fluid.
+      If(s.solid.node.element(instanceIndex).x.greaterThan(0.5), () => {
+        corrA.assign(vec4(0.0));
+        corrB.assign(vec4(0.0));
+      });
 
       s.dTilA.node.element(instanceIndex).assign(corrA);
       s.dTilB.node.element(instanceIndex).assign(corrB);
@@ -672,13 +679,41 @@ export function kDensityCorrect(f: IslandFields, s: ScratchFields, uni: Uni): an
   })().compute(cells);
 }
 
-/** Copy corrected density back into the persistent moment fields. */
-export function kDensityCommit(f: IslandFields, s: ScratchFields): any {
+/**
+ * Commit corrected density with global mass renormalization: semi-Lagrangian
+ * gather advection is not conservative (converging flow duplicates mass), so
+ * the committed field is rescaled by (mass before advection)/(mass after),
+ * bounded to keep genuine bugs visible, then dissipation is applied.
+ * massStat.x = pre-advection mass, massStat.y = post-advection mass.
+ */
+export function kDensityCommit(f: IslandFields, s: ScratchFields, uni: Uni, massStat: GpuField): any {
   const cells = f.dA.count;
   return Fn(() => {
     If(instanceIndex.lessThan(uint(cells)), () => {
-      f.dA.node.element(instanceIndex).assign(s.dTilA.node.element(instanceIndex));
-      f.dB.node.element(instanceIndex).assign(s.dTilB.node.element(instanceIndex));
+      const stat = massStat.node.element(int(0)).toVar();
+      const scale = select(
+        stat.y.greaterThan(1e-6),
+        clamp(stat.x.div(stat.y), 0.55, 1.8),
+        float(1.0),
+      ).mul(uni.dissFactor).toVar();
+      f.dA.node.element(instanceIndex).assign(s.dTilA.node.element(instanceIndex).mul(scale));
+      f.dB.node.element(instanceIndex).assign(s.dTilB.node.element(instanceIndex).mul(scale));
     });
   })().compute(cells);
+}
+
+/** Sum the coarse mass grid (16³, kg in .x) into massStat.{x|y} (single thread over 4096). */
+export function kSumCoarseMass(coarse: GpuField, massStat: GpuField, component: 0 | 1): any {
+  return Fn(() => {
+    If(instanceIndex.equal(uint(0)), () => {
+      const total = float(0).toVar();
+      Loop({ start: int(0), end: int(coarse.count), type: 'int', condition: '<' }, ({ i }: any) => {
+        total.addAssign(coarse.node.element(i).x);
+      });
+      const stat = massStat.node.element(int(0)).toVar();
+      if (component === 0) stat.x.assign(total);
+      else stat.y.assign(total);
+      massStat.node.element(int(0)).assign(stat);
+    });
+  })().compute(1);
 }

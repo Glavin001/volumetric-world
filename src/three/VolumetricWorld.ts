@@ -183,9 +183,21 @@ export class VolumetricWorld {
     const em = activateEmission(ev, material);
     this.emissions.push(em);
 
-    const center = sourceCenter(ev.source);
+    const center0 = sourceCenter(ev.source);
+    // Directional sources get their island biased downstream so the flow stays
+    // covered (islands spawn around the interaction region, not just the source).
+    let center = center0;
+    if (ev.momentum.kind === 'uniform') {
+      const v = ev.momentum.initialVelocityMps;
+      const speed = len(v);
+      if (speed > 2) {
+        const tier0 = this.scheduler.tierFor(center0, ev.fineMassKg, this.cameraInfo);
+        const size = this.preset.tierSizeM[tier0];
+        center = add(center0, scale(norm(v), size * 0.22));
+      }
+    }
     const camera = this.cameraInfo;
-    let island = this.scheduler.findCovering(center, -0.5);
+    let island = this.scheduler.findCovering(center0, -0.5);
     if (!island) {
       const tier = this.scheduler.tierFor(center, ev.fineMassKg, camera);
       island = this.scheduler.allocate({ center: this.islandCenterFor(center, tier), tier, reason: 'event' }, this.simTime, camera);

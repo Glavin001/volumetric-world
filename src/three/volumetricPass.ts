@@ -223,7 +223,8 @@ export class VolumetricPass {
 
   private fbm(p: any) {
     const n1 = this.valueNoise(p);
-    const n2 = this.valueNoise(p.mul(2.73).add(vec3(11.31, 7.7, 5.1))).mul(0.5);
+    // Swizzled second octave breaks up axis-aligned value-noise streaks.
+    const n2 = this.valueNoise(p.yzx.mul(2.73).add(vec3(11.31, 7.7, 5.1))).mul(0.5);
     return n1.add(n2).mul(0.666); // ≈ [-1, 1]
   }
 

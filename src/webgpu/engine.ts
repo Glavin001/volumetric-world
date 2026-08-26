@@ -7,7 +7,7 @@ import {
   IslandFields, ScratchFields,
   kRasterizeSolid, kInjectDensity, kInjectVelocity, kAdvectVelocity, kCurl, kForces,
   kDivergence, kClearScalar, kJacobi, kProject,
-  kDensityForward, kDensityReverse, kDensityCorrect, kDensityCommit,
+  kDensityForward, kDensityReverse, kDensityCorrect, kDensityCommit, kSumCoarseMass,
 } from './solverKernels';
 import {
   VolumeAtlas, createAtlas, slotOffsetVox, initAtlasTextures, COARSE,
@@ -70,7 +70,10 @@ export class IslandGPU {
       densFwd: kDensityForward(f, s, uni),
       densRev: kDensityReverse(f, s, uni),
       densCorr: kDensityCorrect(f, s, uni),
-      densCommit: kDensityCommit(f, s),
+      densCommit: kDensityCommit(f, s, uni, s.massStat),
+      downMassTil: kDownsampleMass(f, s, uni, s.dTilA),
+      sumMassPre: kSumCoarseMass(s.coarseMass, s.massStat, 0),
+      sumMassPost: kSumCoarseMass(s.coarseMass, s.massStat, 1),
       writeVolume: kWriteVolume(f, s, uni, atlas),
       light: kLightMarch(f, uni, atlas, preset.lightSteps),
       clearSlot: kClearVolumeSlot(this.N, uni, atlas),
@@ -140,6 +143,9 @@ export class IslandGPU {
 
     r.compute(k.rasterize);
     r.compute(k.injectDensity);
+    // Pre-advection mass for the conservation renormalization in densCommit.
+    r.compute(k.downMass);
+    r.compute(k.sumMassPre);
     for (const n of k.injectVel) r.compute(n);
     for (const n of k.advect) r.compute(n);
     r.compute(k.curl);
@@ -162,6 +168,8 @@ export class IslandGPU {
     r.compute(k.densFwd);
     r.compute(k.densRev);
     r.compute(k.densCorr);
+    r.compute(k.downMassTil);
+    r.compute(k.sumMassPost);
     r.compute(k.densCommit);
     r.compute(k.writeVolume);
     if (flags.light) r.compute(k.light);
@@ -207,6 +215,7 @@ export class SolverEngine {
       coarseMass: makeField(COARSE, COARSE, COARSE, 4, 'coarseMass'),
       coarseDivPre: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPre'),
       coarseDivPost: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPost'),
+      massStat: makeField(1, 1, 1, 4, 'massStat'),
     };
     for (let sIdx = 0; sIdx < preset.slots; sIdx++) {
       this.islands.push(new IslandGPU(renderer, this.scratch, this.atlas, preset, sIdx));

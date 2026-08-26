@@ -237,6 +237,44 @@ export function kDownsampleMass(f: IslandFields, s: ScratchFields, uni: IslandUn
   })().compute(coarseCells);
 }
 
+/**
+ * Mass-weighted momentum per coarse cell: (Σm·vx, Σm·vy, Σm·vz, Σm) with
+ * velocity averaged from the MAC faces. Read back with the mass grid so
+ * exported packets inherit the plume's actual outgoing velocity instead of
+ * ambient wind (the single biggest cause of "a dome appears out of nowhere
+ * and just sits there" at retirement).
+ */
+export function kDownsampleMomentum(f: IslandFields, s: ScratchFields, uni: IslandUniforms): any {
+  const N = f.N;
+  const block = N / COARSE;
+  const coarseCells = COARSE * COARSE * COARSE;
+  return Fn(() => {
+    If(instanceIndex.lessThan(uint(coarseCells)), () => {
+      const { x, y, z } = fieldCoord(s.coarseMom, instanceIndex);
+      const acc = vec4(0.0).toVar();
+      const cellVol = uni.h.mul(uni.h).mul(uni.h).toVar();
+      Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i }: any) => {
+        Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: j }: any) => {
+          Loop({ start: int(0), end: int(block), type: 'int', condition: '<' }, ({ i: k }: any) => {
+            const cx = x.mul(int(block)).add(k).toVar();
+            const cy = y.mul(int(block)).add(j).toVar();
+            const cz = z.mul(int(block)).add(i).toVar();
+            const m = f.dA.node.element(fieldIndex(f.dA, cx, cy, cz)).w.mul(cellVol).toVar();
+            const vx = f.u.node.element(fieldIndex(f.u, cx, cy, cz))
+              .add(f.u.node.element(fieldIndex(f.u, cx.add(int(1)), cy, cz))).mul(0.5);
+            const vy = f.v.node.element(fieldIndex(f.v, cx, cy, cz))
+              .add(f.v.node.element(fieldIndex(f.v, cx, cy.add(int(1)), cz))).mul(0.5);
+            const vz = f.w.node.element(fieldIndex(f.w, cx, cy, cz))
+              .add(f.w.node.element(fieldIndex(f.w, cx, cy, cz.add(int(1))))).mul(0.5);
+            acc.addAssign(vec4(m.mul(vx), m.mul(vy), m.mul(vz), m));
+          });
+        });
+      });
+      s.coarseMom.node.element(instanceIndex).assign(acc);
+    });
+  })().compute(coarseCells);
+}
+
 /** Downsample |divergence| into a COARSE³ grid of (Σ|div|, max|div|, fluidCells, 0). */
 export function kDownsampleAbsDiv(f: IslandFields, s: ScratchFields, dst: GpuField): any {
   const N = f.N;

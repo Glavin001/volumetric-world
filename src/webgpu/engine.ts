@@ -11,7 +11,7 @@ import {
 } from './solverKernels';
 import {
   VolumeAtlas, createAtlas, slotOffsetVox, initAtlasTextures, COARSE,
-  kWriteVolume, kLightMarch, kClearVolumeSlot, kDownsampleMass, kDownsampleAbsDiv,
+  kWriteVolume, kLightMarch, kClearVolumeSlot, kDownsampleMass, kDownsampleMomentum, kDownsampleAbsDiv,
   kClearShell, kShift, kCopy, kPacketDensity, kPacketVelocity,
 } from './outputKernels';
 
@@ -78,6 +78,7 @@ export class IslandGPU {
       light: kLightMarch(f, uni, atlas, preset.lightSteps),
       clearSlot: kClearVolumeSlot(this.N, uni, atlas),
       downMass: kDownsampleMass(f, s, uni),
+      downMom: kDownsampleMomentum(f, s, uni),
       downDivPre: kDownsampleAbsDiv(f, s, s.coarseDivPre),
       downDivPost: kDownsampleAbsDiv(f, s, s.coarseDivPost),
       clearShell: kClearShell(f, uni),
@@ -179,6 +180,11 @@ export class IslandGPU {
     this.renderer.compute(this.k.downMass);
   }
 
+  /** Fill the shared coarseMom grid with this island's mass-weighted momentum. */
+  computeMomentumGrid(): void {
+    this.renderer.compute(this.k.downMom);
+  }
+
   clearShell(keep: number, shellVox: number): void {
     (this.uni.shellKeep as any).value = keep;
     (this.uni.shellVox as any).value = shellVox;
@@ -213,6 +219,7 @@ export class SolverEngine {
       curl: makeField(N, N, N, 4, 'curl'),
       solid: makeField(N, N, N, 4, 'solid'),
       coarseMass: makeField(COARSE, COARSE, COARSE, 4, 'coarseMass'),
+      coarseMom: makeField(COARSE, COARSE, COARSE, 4, 'coarseMom'),
       coarseDivPre: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPre'),
       coarseDivPost: makeField(COARSE, COARSE, COARSE, 4, 'coarseDivPost'),
       massStat: makeField(1, 1, 1, 4, 'massStat'),

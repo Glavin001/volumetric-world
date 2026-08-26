@@ -37,6 +37,7 @@ export interface ScratchFields {
   curl: GpuField;
   solid: GpuField;
   coarseMass: GpuField;
+  coarseMom: GpuField;
   coarseDivPre: GpuField;
   coarseDivPost: GpuField;
   /** vec4[1]: x = pre-advection mass, y = post-advection mass (renormalization). */

@@ -329,6 +329,13 @@ export class VolumetricWorld {
       this.packets.update(pdt, this.wind);
     }
 
+    // Fade-in for freshly promoted islands (their packets fade out in step).
+    for (const island of this.scheduler.activeIslands()) {
+      if (!island.retiring && island.renderFade < 1) {
+        island.renderFade = Math.min(1, island.renderFade + dt / 0.3);
+      }
+    }
+
     // Retire fades → free slots.
     for (const job of [...this.retireJobs]) {
       if (job.phase === 'fading') {
@@ -509,6 +516,8 @@ export class VolumetricWorld {
       if (!island.active) return;
       gpu.computeMassGrid();
       const grid = await this.engine.readField(this.engine.scratch.coarseMass);
+      gpu.computeMomentumGrid();
+      const mom = await this.engine.readField(this.engine.scratch.coarseMom);
       let mass = 0;
       for (let i = 0; i < grid.length; i += 4) mass += grid[i];
       island.massKg = mass;
@@ -547,9 +556,30 @@ export class VolumetricWorld {
             }
           }
         }
-        const protos = packetsFromCoarseGrid(shellGrid, c, island.origin, island.sizeM, 0.05);
+        // The momentum grid is masked to the same shell cells so the group
+        // means reflect only exported material.
+        const shellMom = new Float32Array(mom.length);
+        for (let z = 0; z < c; z++) {
+          for (let y = 0; y < c; y++) {
+            for (let x = 0; x < c; x++) {
+              const i = (x + y * c + z * c * c) * 4;
+              const isShell = !(x > 0 && x < c - 1 && y > 0 && y < c - 1 && z > 0 && z < c - 1);
+              if (isShell) {
+                shellMom[i] = mom[i];
+                shellMom[i + 1] = mom[i + 1];
+                shellMom[i + 2] = mom[i + 2];
+                shellMom[i + 3] = mom[i + 3];
+              }
+            }
+          }
+        }
+        const protos = packetsFromCoarseGrid(shellGrid, c, island.origin, island.sizeM, 0.05, {
+          momentum: shellMom,
+        });
         for (const p of protos) {
-          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, [...this.wind] as Vec3, island.slot, 0.35);
+          // Momentum-conserving handoff: the packet keeps the outgoing fluid
+          // velocity (wind takes over gradually via the packet drag model).
+          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, p.velocity, island.slot, 0.35);
         }
         gpu.clearShell(0, this.preset.slotRes / COARSE);
         island.lastExportAt = this.simTime;
@@ -567,10 +597,18 @@ export class VolumetricWorld {
       this.enqueueReadback(async () => {
         gpu.computeMassGrid();
         const grid = await this.engine.readField(this.engine.scratch.coarseMass);
+        gpu.computeMomentumGrid();
+        const mom = await this.engine.readField(this.engine.scratch.coarseMom);
         const material = this.islandMaterial.get(island.slot) ?? getMaterial('concrete');
-        const protos = packetsFromCoarseGrid(grid, COARSE, island.origin, island.sizeM, 0.03);
+        // Retirement is a full-plume export: 4³ moment groups keep the plume's
+        // structure (an octant match collapses it into one featureless dome),
+        // and each packet inherits its group's mass-weighted fluid velocity.
+        const protos = packetsFromCoarseGrid(grid, COARSE, island.origin, island.sizeM, 0.03, {
+          momentum: mom,
+          div: 4,
+        });
         for (const p of protos) {
-          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, [...this.wind] as Vec3, island.slot, 0);
+          this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, p.velocity, island.slot, 0);
         }
         job.phase = 'fading';
         job.fadeEnd = this.simTime + 0.35;
@@ -636,6 +674,10 @@ export class VolumetricWorld {
     const injectedMass = injected.reduce((m, p) => m + p.massKg, 0);
     packPromo(gpu.uni, injected);
     gpu.injectPromotedPackets();
+    // Crossfade: the island rises from 0 while the consumed packets keep
+    // rendering and fade out over the same window — promotion used to pop.
+    island.renderFade = 0;
+    this.packets.retireVisual(injected);
     island.estimatedMassKg = injectedMass;
     island.lastEventAt = this.simTime;
     this.promoteCooldownUntil = this.simTime + 3;
@@ -744,9 +786,10 @@ export class VolumetricWorld {
     }
     (pass.islandCount as any).value = count;
 
-    // Nearest packets for rendering.
+    // Nearest packets for rendering (the dying list renders during promotion
+    // crossfades but is excluded from physics/mass).
     const cam = this.cameraInfo.position;
-    const sorted = [...this.packets.packets].sort(
+    const sorted = [...this.packets.packets, ...this.packets.dying].sort(
       (a, b) => len(sub(a.position, cam)) - len(sub(b.position, cam)),
     );
     const parr = (pass.packets as any).array as THREE.Vector4[];

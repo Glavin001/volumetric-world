@@ -73,6 +73,13 @@ export class IslandUniforms {
   sweepBase = uniform(new THREE.Vector2(0, 0));
   /** World meters advanced per layer along the sun ray. */
   sweepStepLen = uniform(0.1);
+
+  // Rebox source (in-place re-tiering): the OLD slot's atlas region, described
+  // entirely by uniforms so one compiled kernel resamples from any slot.
+  reboxSrcOff = uniform(new THREE.Vector3());
+  reboxSrcRes = uniform(32);
+  reboxSrcOrigin = uniform(new THREE.Vector3());
+  reboxSrcSize = uniform(10);
   shellKeep = uniform(0); // clearShell keep factor
   shellVox = uniform(2);
   shiftVox = uniform(new THREE.Vector3());

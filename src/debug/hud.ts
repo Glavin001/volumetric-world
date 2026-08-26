@@ -55,6 +55,9 @@ export class Hud {
     this.gui
       .add({ preset: presetName }, 'preset', Object.keys(PRESETS))
       .onChange((v: string) => this.reload({ preset: v }));
+    this.gui
+      .add(world.scheduler, 'focusMode', ['camera', 'events'])
+      .name('LOD focus');
     const cam = this.gui.addFolder('camera');
     if (cameraModes) {
       this.cameraModes = cameraModes;
@@ -132,7 +135,7 @@ export class Hud {
         .activeIslands()
         .map(
           (i) =>
-            `  slot${i.slot} ${i.tier} ${i.rateHz}Hz ~${i.estimatedMassKg.toFixed(0)}kg imp=${i.importance.toFixed(3)}${i.retiring ? ' retiring' : ''}`,
+            `  slot${i.slot} ${i.tier} ${i.cls} ${this.world.engine.islands[i.slot].N}³ ${i.rateHz.toFixed(0)}Hz ~${i.estimatedMassKg.toFixed(0)}kg imp=${i.importance.toFixed(3)}${i.retiring ? ' retiring' : ''}${i.reboxing ? ' reboxing' : ''}`,
         )
         .join('\n');
       this.statsEl.textContent =

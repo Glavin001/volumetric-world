@@ -116,6 +116,10 @@ async function boot(): Promise<void> {
     seed: Number(params.get('seed') ?? 7),
   });
 
+  // Viewer-centric LOD focus: 'camera' (default) allocates fidelity relative
+  // to the viewer; 'events' gives every event the best free slot.
+  world.scheduler.focusMode = params.get('focus') === 'events' ? 'events' : 'camera';
+
   diag.attachDevice((world.renderer as any).backend?.device, world.gpuInfo + (world.softwareAdapter ? ' [software]' : ''));
 
   const scene = new THREE.Scene();

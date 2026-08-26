@@ -282,7 +282,6 @@ export class VolumetricPass {
   private buildRaymarch(temporal: boolean): any {
     const atlas = this.atlas;
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
-    const N = float(atlas.slotRes);
 
     if (this.buildLevel >= 3) {
       return Fn(() => vec4(0.0, 0.0, 0.0, 1.0))();
@@ -470,13 +469,14 @@ export class VolumetricPass {
               const inside = local.x.greaterThan(0.0).and(local.y.greaterThan(0.0)).and(local.z.greaterThan(0.0))
                 .and(local.x.lessThan(1.0)).and(local.y.lessThan(1.0)).and(local.z.lessThan(1.0));
               If(inside, () => {
-                const uvw0 = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(N)).div(atlasDims).toVar();
+                const slotN = m2.z; // per-island slot resolution (mixed-res pool)
+                const uvw0 = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(slotN)).div(atlasDims).toVar();
                 // Advective interpolation between low-rate sim steps:
                 // sample where this parcel was at the last field commit.
                 const vel = texture3D(atlas.texVel, uvw0, int(0)).xyz;
                 const p2 = p.sub(vel.mul(m2.x)).toVar();
                 const local2 = clamp(p2.sub(m0.xyz).div(m0.w), vec3(0.002), vec3(0.998)).toVar();
-                const uvw = m1.xyz.add(local2.mul(N)).div(atlasDims).toVar();
+                const uvw = m1.xyz.add(local2.mul(slotN)).div(atlasDims).toVar();
                 const a = texture3D(atlas.texA, uvw, int(0)).toVar();
                 dbgMaxLoad.assign(max(dbgMaxLoad, a.w));
                 dbgInside.addAssign(1.0);
@@ -681,7 +681,6 @@ export class VolumetricPass {
   private buildComposite(): any {
     const atlas = this.atlas;
     const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
-    const N = float(atlas.slotRes);
     return Fn(() => {
       const uvN = uv().toVar();
       const scene = this.sceneTexNode.sample(uvN).toVar();
@@ -713,12 +712,13 @@ export class VolumetricPass {
       for (let s = 0; s < (this.buildLevel < 2 ? MAX_ISLANDS : 0); s++) {
         const m0 = this.islandMeta.element(int(s * ISLE_STRIDE));
         const m1 = this.islandMeta.element(int(s * ISLE_STRIDE + 1));
+        const m2 = this.islandMeta.element(int(s * ISLE_STRIDE + 2));
         If(m1.w.greaterThan(0.5), () => {
           const local = world.sub(m0.xyz).div(m0.w).toVar();
           const inside = local.x.greaterThan(-0.02).and(local.y.greaterThan(-0.02)).and(local.z.greaterThan(-0.02))
             .and(local.x.lessThan(1.02)).and(local.y.lessThan(1.02)).and(local.z.lessThan(1.02));
           If(inside, () => {
-            const uvw = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(N)).div(atlasDims);
+            const uvw = m1.xyz.add(clamp(local, vec3(0.002), vec3(0.998)).mul(m2.z)).div(atlasDims);
             const shTex = texture3D(atlas.texShadow, uvw, int(0));
             const sh = min(shTex.x.add(shTex.y.div(255.0)), 1.0); // 16-bit sqrt(T)
             shadowF.mulAssign(sh.mul(sh));

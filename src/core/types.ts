@@ -156,6 +156,8 @@ export interface QualityPreset {
   slotRes: number;
   /** Number of pooled island slots (atlas capacity). */
   slots: number;
+  /** Per-slot resolution class: fine = slotRes, coarse ≈ slotRes/2 (viewer-centric LOD pool). */
+  slotClasses: ('fine' | 'coarse')[];
   /** Camera raymarch step count at quality 1.0. */
   raySteps: number;
   /** Max steps of the per-island sun-transmittance sweep. */

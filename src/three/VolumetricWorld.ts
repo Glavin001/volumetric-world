@@ -96,6 +96,8 @@ export class VolumetricWorld {
   private effectors: ActiveEffector[] = [];
   private islandMaterial = new Map<number, AerosolMaterial>();
   private retireJobs: RetireJob[] = [];
+  private reboxJobs: { oldIsland: IslandState; newIsland: IslandState; end: number }[] = [];
+  private lastReboxAt = -10;
   private readbackChain: Promise<unknown> = Promise.resolve();
   private lastPacketUpdate = 0;
   private lastPromoteCheck = 0;
@@ -314,7 +316,7 @@ export class VolumetricWorld {
     this.scheduler.updateImportance(this.simTime, this.cameraInfo);
     this.beginRetirements();
     for (const island of this.scheduler.activeIslands()) {
-      if (!island.retiring) {
+      if (!island.retiring && !island.reboxing) {
         this.stepIsland(island, dt);
         island.lastStepAt = this.simTime;
         island.stepCount++;
@@ -324,6 +326,8 @@ export class VolumetricWorld {
   }
 
   private commonUpdate(dt: number, force = false): void {
+    this.updateReboxes();
+
     // Far-field packets at ~10 Hz.
     if (force || this.simTime - this.lastPacketUpdate >= 0.1) {
       const pdt = force ? dt : Math.min(this.simTime - this.lastPacketUpdate, 0.25);
@@ -332,9 +336,9 @@ export class VolumetricWorld {
       this.packets.update(pdt, this.wind);
     }
 
-    // Fade-in for freshly promoted islands (their packets fade out in step).
+    // Fade-in for freshly promoted/reboxed islands (their source fades out).
     for (const island of this.scheduler.activeIslands()) {
-      if (!island.retiring && island.renderFade < 1) {
+      if (!island.retiring && !island.reboxing && island.renderFade < 1) {
         island.renderFade = Math.min(1, island.renderFade + dt / 0.3);
       }
     }
@@ -370,7 +374,7 @@ export class VolumetricWorld {
 
   private configureIslandPlacement(island: IslandState): void {
     const gpu = this.gpuFor(island);
-    const h = island.sizeM / this.preset.slotRes;
+    const h = island.sizeM / gpu.N;
     (gpu.uni.origin.value as THREE.Vector3).set(island.origin[0], island.origin[1], island.origin[2]);
     (gpu.uni.h as any).value = h;
     (gpu.uni.invH as any).value = 1 / h;
@@ -417,7 +421,7 @@ export class VolumetricWorld {
     const material = this.islandMaterial.get(island.slot) ?? getMaterial('concrete');
 
     // --- scrolling: follow the tracked focus in integer voxel increments ---
-    const h = island.sizeM / this.preset.slotRes;
+    const h = island.sizeM / gpu.N;
     const drift = sub(island.focus, island.center);
     const driftLen = len([drift[0], 0, drift[2]]);
     if (driftLen > island.sizeM * 0.16) {
@@ -426,7 +430,7 @@ export class VolumetricWorld {
         0,
         Math.round(drift[2] / h),
       ];
-      const maxShift = Math.floor(this.preset.slotRes / 4);
+      const maxShift = Math.floor(gpu.N / 4);
       shift[0] = Math.max(-maxShift, Math.min(maxShift, shift[0]));
       shift[2] = Math.max(-maxShift, Math.min(maxShift, shift[2]));
       if (shift[0] !== 0 || shift[2] !== 0) {
@@ -458,7 +462,7 @@ export class VolumetricWorld {
     const light = this.scheduler.lightDue(island, this.simTime);
     if (light) {
       island.lastLightAt = this.simTime;
-      configureSweep(uni, norm(this.sun.dir), this.preset.slotRes, island.sizeM / this.preset.slotRes);
+      configureSweep(uni, norm(this.sun.dir), gpu.N, island.sizeM / gpu.N);
     }
     gpu.step({ light, metrics: this.metricsEnabled });
     island.estimatedMassKg *= Math.exp(-material.dissipationPerSecond * dt);
@@ -587,7 +591,7 @@ export class VolumetricWorld {
           // velocity (wind takes over gradually via the packet drag model).
           this.packets.spawnFromMaterial(material, p.position, p.radii, p.massKg, p.velocity, island.slot, 0.35);
         }
-        gpu.clearShell(0, this.preset.slotRes / COARSE);
+        gpu.clearShell(0, gpu.N / COARSE);
         island.lastExportAt = this.simTime;
       }
     });
@@ -620,6 +624,65 @@ export class VolumetricWorld {
         job.fadeEnd = this.simTime + 0.35;
       });
     }
+  }
+
+  /**
+   * Viewer-centric re-tiering: when an island's resolution class has disagreed
+   * with its camera-relative need for a while (hysteresis in the scheduler),
+   * resample it in place into a slot of the right class — GPU-only, no packet
+   * round-trip — and crossfade the two slots so nothing pops. One job at a
+   * time, rate-limited.
+   */
+  private updateReboxes(): void {
+    // Finish jobs whose crossfade elapsed.
+    for (const job of [...this.reboxJobs]) {
+      job.oldIsland.renderFade = Math.max(0, (job.end - this.simTime) / 0.3);
+      if (this.simTime >= job.end) {
+        this.gpuFor(job.oldIsland).reset();
+        this.scheduler.free(job.oldIsland);
+        this.reboxJobs.splice(this.reboxJobs.indexOf(job), 1);
+      }
+    }
+    if (this.reboxJobs.length > 0 || this.simTime - this.lastReboxAt < 1) return;
+
+    const candidate = this.scheduler
+      .activeIslands()
+      .filter((i) => !i.retiring && !i.reboxing && i.classMismatchSince !== Infinity &&
+        this.simTime - i.classMismatchSince > 1.5)
+      .sort((a, b) => b.importance - a.importance)[0];
+    if (!candidate) return;
+
+    const wanted = this.scheduler.classFor(candidate.center, this.cameraInfo);
+    const fresh = this.scheduler.allocate(
+      { center: [...candidate.center] as Vec3, tier: candidate.tier, reason: 'rebox', cls: wanted },
+      this.simTime, this.cameraInfo,
+    );
+    if (!fresh) return; // no free slot of the target class — try again later
+
+    // Same geometry, same state — only the resolution changes.
+    fresh.sizeM = candidate.sizeM;
+    fresh.center = [...candidate.center] as [number, number, number];
+    fresh.origin = [...candidate.origin] as [number, number, number];
+    fresh.focus = [...candidate.focus] as [number, number, number];
+    fresh.massKg = candidate.massKg;
+    fresh.estimatedMassKg = candidate.estimatedMassKg;
+    fresh.interactionCount = candidate.interactionCount;
+    fresh.lastEventAt = candidate.lastEventAt;
+    fresh.importance = candidate.importance;
+    fresh.renderFade = 0;
+    const material = this.islandMaterial.get(candidate.slot);
+    if (material) this.islandMaterial.set(fresh.slot, material);
+
+    this.configureIslandPlacement(fresh);
+    const freshGpu = this.gpuFor(fresh);
+    freshGpu.reset();
+    configureSweep(freshGpu.uni, norm(this.sun.dir), freshGpu.N, fresh.sizeM / freshGpu.N);
+    freshGpu.reboxFrom(this.gpuFor(candidate), candidate.origin, candidate.sizeM);
+    fresh.lastLightAt = this.simTime;
+
+    candidate.reboxing = true;
+    this.reboxJobs.push({ oldIsland: candidate, newIsland: fresh, end: this.simTime + 0.3 });
+    this.lastReboxAt = this.simTime;
   }
 
   private applyBodyWakesToPackets(dt: number): void {
@@ -783,11 +846,11 @@ export class VolumetricWorld {
       const so = gpu.uni.slotOffsetVox.value as THREE.Vector3;
       meta[b + 0].set(island.origin[0], island.origin[1], island.origin[2], island.sizeM);
       meta[b + 1].set(so.x, so.y, so.z, active ? 1 : 0);
-      // m2.zw: (reserved for slot res), material detail scale — the same
-      // world-space noise scale the packets carry, so both representations
-      // sample one continuous detail field.
+      // m2.zw: slot resolution (mixed-res pool) and material detail scale —
+      // the same world-space noise scale the packets carry, so both
+      // representations sample one continuous detail field.
       const detailScaleM = this.islandMaterial.get(island.slot)?.detail.baseScaleM ?? 1.4;
-      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, 0, detailScaleM);
+      meta[b + 2].set(Math.min(this.simTime - island.lastStepAt, 0.4), island.renderFade, gpu.N, detailScaleM);
       if (active) count++;
     }
     (pass.islandCount as any).value = count;

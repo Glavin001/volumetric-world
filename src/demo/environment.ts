@@ -34,7 +34,7 @@ export function buildEnvironment(world: VolumetricWorld, scene: THREE.Scene): En
   // Subtle road strip for orientation.
   const road = new THREE.Mesh(
     new THREE.PlaneGeometry(300, 7),
-    new THREE.MeshStandardMaterial({ color: 0x4a4a4e, roughness: 0.9 }),
+    new THREE.MeshStandardMaterial({ color: 0x606066, roughness: 0.9 }),
   );
   road.rotation.x = -Math.PI / 2;
   road.position.y = 0.02;
@@ -52,7 +52,7 @@ export function buildEnvironment(world: VolumetricWorld, scene: THREE.Scene): En
   scene.add(sunLight);
   scene.add(sunLight.target);
 
-  const hemi = new THREE.HemisphereLight(0x9db8dd, 0x5b5348, 0.9);
+  const hemi = new THREE.HemisphereLight(0x9db8dd, 0x5b5348, 1.25);
   scene.add(hemi);
 
   const env: EnvCtx = { world, scene, sunLight };

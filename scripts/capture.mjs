@@ -11,13 +11,13 @@ const only = process.argv[3];
 const SHOTS = [
   { scene: 'puff', steps: 46 },
   { scene: 'vortex', steps: 46 },
-  { scene: 'obstacles', steps: 78 },
+  { scene: 'obstacles', steps: 112 },
   { scene: 'slab', steps: 64 },
   { scene: 'hiddenCar', steps: 124 },
   { scene: 'doorway', steps: 104 },
   { scene: 'backlit', steps: 34 },
   { scene: 'inside', steps: 44 },
-  { scene: 'multi', steps: 96 },
+  { scene: 'multi', steps: 78 },
   { scene: 'cityblock', steps: 175 },
 ];
 

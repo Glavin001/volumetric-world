@@ -144,8 +144,10 @@ export function kLightMarch(f: IslandFields, uni: IslandUniforms, atlas: VolumeA
       const invSize = float(1.0).div(uni.sizeM).toVar();
       const od = float(0).toVar();
       const atlasDims = vec3(atlas.dimX, atlas.dimY, atlas.dimZ);
+      // Per-voxel start jitter breaks up concentric shadow banding.
+      const jit = float(instanceIndex.toFloat().mul(0.6180339887)).fract().toVar();
       Loop({ start: int(1), end: int(lightSteps), type: 'int', condition: '<=' }, ({ i }: any) => {
-        const q = p.add(uni.sunDir.mul(stepLen.mul(float(i).sub(0.5)))).toVar();
+        const q = p.add(uni.sunDir.mul(stepLen.mul(float(i).sub(1.0).add(jit).add(0.25)))).toVar();
         const local = q.sub(uni.origin).mul(invSize).toVar();
         If(
           local.x.lessThan(0.0).or(local.y.lessThan(0.0)).or(local.z.lessThan(0.0))

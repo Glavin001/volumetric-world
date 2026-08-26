@@ -45,7 +45,7 @@ export class VolumetricPass {
   skyColor = uniform(new THREE.Color(0.45, 0.62, 0.85));
   skyIntensity = uniform(1.6);
   groundBounce = uniform(new THREE.Color(0.25, 0.22, 0.2));
-  exposure = uniform(0.55);
+  exposure = uniform(0.62);
   raySteps = uniform(64);
   detailStrength = uniform(0.75);
   detailScale = uniform(1.4);
@@ -310,6 +310,9 @@ export class VolumetricPass {
         const cosT = dot(rayDir, this.sunDir).toVar();
         const tRepW = float(0).toVar();
         const tRepSum = float(0).toVar();
+        const dbgAcc = float(0).toVar();
+        const dbgMaxLoad = float(0).toVar();
+        const dbgInside = float(0).toVar();
 
         Loop({ start: int(0), end: steps, type: 'int', condition: '<' }, ({ i }: any) => {
           const t = tEnter.add(ds.mul(float(i).add(ign))).toVar();
@@ -338,6 +341,8 @@ export class VolumetricPass {
                 const local2 = clamp(p2.sub(m0.xyz).div(m0.w), vec3(0.002), vec3(0.998)).toVar();
                 const uvw = m1.xyz.add(local2.mul(N)).div(atlasDims).toVar();
                 const a = texture3D(atlas.texA, uvw, int(0)).toVar();
+                dbgMaxLoad.assign(max(dbgMaxLoad, a.w));
+                dbgInside.addAssign(1.0);
                 If(a.w.greaterThan(1e-4), () => {
                   const b = texture3D(atlas.texB, uvw, int(0)).toVar();
                   // Sub-grid detail: advected-phase fbm modulation with edge erosion
@@ -400,12 +405,16 @@ export class VolumetricPass {
             });
           });
 
+          dbgAcc.addAssign(dot(sigT, vec3(1.0)).mul(ds));
           const sLum = max(dot(sigT, vec3(0.2126, 0.7152, 0.0722)), 1e-5).toVar();
           If(sLum.greaterThan(2e-4), () => {
             const scLum = max(dot(sigS, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
             const g = clamp(gW.div(scLum), -0.9, 0.9).toVar();
 
             // Dual-lobe HG + 3 multiple-scattering octaves (Frostbite-style).
+            // The 8-bit shadow cache can quantize deep-core transmittance to
+            // exactly 0, which would kill every octave — floor it first.
+            const sunT = max(sunTrans, 0.004).toVar();
             const sun = vec3(0.0).toVar();
             const octA = [1.0, 0.55, 0.3];
             const octB = [1.0, 0.62, 0.38];
@@ -415,11 +424,11 @@ export class VolumetricPass {
               sun.addAssign(
                 this.sunColor.mul(this.sunIntensity)
                   .mul(ph)
-                  .mul(pow(sunTrans, float(octC[o])))
+                  .mul(pow(sunT, float(octC[o])))
                   .mul(octA[o]),
               );
             }
-            const ambOcc = mix(0.3, 1.0, sunTrans).toVar();
+            const ambOcc = mix(0.42, 1.0, sunT).toVar();
             const ambient = this.skyColor.mul(this.skyIntensity).mul(0.0796).mul(ambOcc)
               .add(this.groundBounce.mul(0.0398).mul(ambOcc));
 
@@ -437,6 +446,17 @@ export class VolumetricPass {
         });
 
         const cur = vec4(radiance, T).toVar();
+        If(this.debugMode.equal(5), () => {
+          cur.assign(vec4(vec3(clamp(dbgAcc.mul(0.1), 0.0, 1.0)), 1.0));
+        });
+        If(this.debugMode.equal(7), () => {
+          cur.assign(vec4(
+            clamp(dbgMaxLoad.mul(0.5), 0.0, 1.0),
+            clamp(dbgInside.div(24.0), 0.0, 1.0),
+            0.0,
+            1.0,
+          ));
+        });
 
         if (temporal) {
           // Reproject via the representative scatter distance and blend history.
@@ -463,6 +483,30 @@ export class VolumetricPass {
       If(this.debugMode.equal(1), () => {
         const dd = clamp(opaqueDist.div(60.0), 0.0, 1.0);
         outCol.assign(vec4(dd, dd, dd, 1.0));
+      });
+      // Debug: GPU-side meta dump for slot0/slot1 (constant colors).
+      If(this.debugMode.equal(8), () => {
+        const a0 = this.islandMeta.element(int(0));
+        const a1 = this.islandMeta.element(int(3));
+        If(uvN.x.lessThan(0.5), () => {
+          outCol.assign(vec4(a0.x.mul(-0.05), a0.z.mul(-0.05), a0.w.mul(0.05), 1.0));
+        }).Else(() => {
+          outCol.assign(vec4(a1.x.mul(-0.05), a1.z.mul(-0.05), a1.w.mul(0.05), 1.0));
+        });
+      });
+      // Debug: raw atlas mid-slice (all slots side by side).
+      If(this.debugMode.equal(6), () => {
+        const a6 = texture3D(atlas.texA, vec3(uvN.x, uvN.y, 0.5), int(0));
+        outCol.assign(vec4(clamp(a6.xyz.mul(0.05), vec3(0.0), vec3(1.0)).add(vec3(a6.w.mul(0.2), 0.0, 0.0)), 1.0));
+      });
+      // Debug: march interval diagnostics (r=hit, g=tEnter/100, b=span/30).
+      If(this.debugMode.equal(4), () => {
+        outCol.assign(vec4(
+          anyVolume,
+          clamp(tEnter.div(100.0), 0.0, 1.0),
+          clamp(tExit.sub(tEnter).div(30.0), 0.0, 1.0),
+          1.0,
+        ));
       });
 
       return outCol;
@@ -514,7 +558,7 @@ export class VolumetricPass {
       const srgb = pow(mapped, vec3(1.0 / 2.2)).toVar();
 
       const outc = vec4(srgb, 1.0).toVar();
-      If(this.debugMode.equal(1), () => {
+      If(this.debugMode.greaterThan(0.5), () => {
         outc.assign(vec4(vol.xyz, 1.0));
       });
       return outc;

@@ -190,7 +190,7 @@ export const SCENES: SceneDef[] = [
     what: 'Off-screen world-space interaction: a hidden car stirs the visible cloud before it appears.',
     setup(ctx) {
       lookAt(ctx, [-1, 3.4, 17], [1.5, 2.4, 0]);
-      setSunAngles(ctx.env, 40, 150);
+      setSunAngles(ctx.env, 38, 35);
       // Opaque wall between camera and the road (car passes behind it).
       addBuilding(ctx.env, [1.5, 2.6, 7.5], [12, 5.2, 1.1], 0x93856f);
       emitPuff(ctx.world, [1.5, 1.7, 0], 2.4, 170, 'concrete', 0.7);
@@ -270,13 +270,13 @@ export const SCENES: SceneDef[] = [
     title: 'Four simultaneous collapses',
     what: 'Multi-island scheduling: staggered tiers and rates under one GPU budget.',
     setup(ctx) {
-      lookAt(ctx, [22, 13, 24], [0, 2, 0]);
+      lookAt(ctx, [34, 25, 37], [-1, 0, -1]);
       setSunAngles(ctx.env, 48, 120);
       const spots: Vec3[] = [
-        [-9, 0, -8],
-        [9, 0, -7],
-        [-8, 0, 8],
-        [10, 0, 9],
+        [-14, 0, -12],
+        [13, 0, -11],
+        [-13, 0, 10],
+        [14, 0, 12],
       ];
       ctx.state.buildings = spots.map((p) =>
         addBuilding(ctx.env, [p[0], 2.6, p[2] - 3.6], [4.5, 5.2, 3.4], 0x968878),
@@ -287,7 +287,7 @@ export const SCENES: SceneDef[] = [
       const emitted = ctx.state.emitted as number;
       const buildings = ctx.state.buildings as Building[];
       if (emitted < 4 && t > emitted * 0.55) {
-        collapseBuilding(ctx.env, buildings[emitted], 210 + emitted * 30, emitted * 7 + 1);
+        collapseBuilding(ctx.env, buildings[emitted], 135 + emitted * 20, emitted * 7 + 1);
         ctx.state.emitted = emitted + 1;
       }
     },
@@ -297,7 +297,7 @@ export const SCENES: SceneDef[] = [
     title: 'City-block persistence',
     what: 'Grid→packet handoff: retiring islands become drifting anisotropic volume packets in the wind.',
     setup(ctx) {
-      lookAt(ctx, [26, 15, 30], [-2, 2, -4]);
+      lookAt(ctx, [30, 21, 36], [0, 1, -4]);
       setSunAngles(ctx.env, 42, 118);
       ctx.world.setWind([2.6, 0, 0.7]);
       const buildings: Building[] = [];
@@ -319,10 +319,10 @@ export const SCENES: SceneDef[] = [
       const emitted = ctx.state.emitted as number;
       const buildings = ctx.state.buildings as Building[];
       if (emitted === 0 && t > 0.2) {
-        collapseBuilding(ctx.env, buildings[0], 260, 21); // (-13, ·, -16)
+        collapseBuilding(ctx.env, buildings[5], 260, 21); // (13, ·, -16): dust drifts +x into open ground
         ctx.state.emitted = 1;
       } else if (emitted === 1 && t > 1.4) {
-        collapseBuilding(ctx.env, buildings[1], 230, 33); // (-13, ·, -4)
+        collapseBuilding(ctx.env, buildings[1], 230, 33); // (-13, ·, -4): dust rides the street canyon
         ctx.state.emitted = 2;
       }
     },

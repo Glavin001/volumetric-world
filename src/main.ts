@@ -3,6 +3,7 @@ import { VolumetricWorld, type WorldMetrics } from './three/VolumetricWorld';
 import { buildEnvironment } from './demo/environment';
 import { SCENES, sceneById, type SceneCtx } from './demo/scenes';
 import { Hud } from './debug/hud';
+import { Diag } from './debug/diag';
 import type { Vec3 } from './core/types';
 
 declare global {
@@ -30,17 +31,67 @@ interface TestApi {
 
 const params = new URLSearchParams(location.search);
 const sceneId = params.get('scene') ?? 'puff';
-const presetName = params.get('preset') ?? 'medium';
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+const presetName = params.get('preset') ?? (isMobile ? 'low' : 'medium');
 const testMode = params.get('test') === '1';
 const autoMetrics = params.get('metrics') === '1' || testMode;
+const diag = new Diag(params.get('diag') === '1');
+
+/**
+ * ?safe=1 — plain three.js scene with no volumetric engine at all.
+ * Isolates "does three+WebGPU work in this browser" from engine issues.
+ */
+async function bootSafe(canvas: HTMLCanvasElement): Promise<void> {
+  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
+  await renderer.init();
+  diag.attachDevice((renderer as any).backend?.device, 'safe mode (no engine)');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0.5, 0.65, 0.85);
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 300);
+  camera.position.set(8, 5, 10);
+  camera.lookAt(0, 1, 0);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.MeshStandardMaterial({ color: 0x8d8779 }));
+  ground.rotation.x = -Math.PI / 2;
+  scene.add(ground);
+  const box = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), new THREE.MeshStandardMaterial({ color: 0xb0603a }));
+  box.position.y = 1;
+  scene.add(box);
+  const sun = new THREE.DirectionalLight(0xffffff, 3);
+  sun.position.set(20, 40, 10);
+  scene.add(sun, new THREE.HemisphereLight(0x9db8dd, 0x5b5348, 1.2));
+  const resize = (): void => {
+    const dpr = Math.min(window.devicePixelRatio, 1.5);
+    const w = Math.floor(window.innerWidth * dpr);
+    const h = Math.floor(window.innerHeight * dpr);
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  };
+  window.addEventListener('resize', resize);
+  resize();
+  const loop = (t: number): void => {
+    requestAnimationFrame(loop);
+    box.rotation.y = t / 1200;
+    renderer.render(scene, camera);
+  };
+  window.__vwReady = true;
+  document.getElementById('loading')?.remove();
+  requestAnimationFrame(loop);
+}
 
 async function boot(): Promise<void> {
   const canvas = document.getElementById('view') as HTMLCanvasElement;
+  if (params.get('safe') === '1') {
+    await bootSafe(canvas);
+    return;
+  }
   const world = await VolumetricWorld.create(canvas, {
     preset: presetName,
     metrics: autoMetrics,
     seed: Number(params.get('seed') ?? 7),
   });
+
+  diag.attachDevice((world.renderer as any).backend?.device, world.gpuInfo + (world.softwareAdapter ? ' [software]' : ''));
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 300);
@@ -65,12 +116,13 @@ async function boot(): Promise<void> {
   };
 
   const resize = (): void => {
+    // Bake DPR into the size passed to three (pixelRatio stays 1) so the
+    // renderer's viewport, the canvas buffer, and our RTs always agree —
+    // a manual canvas.width override broke presentation on DPR>1 displays.
     const dpr = testMode ? 1 : Math.min(window.devicePixelRatio, 1.5);
     const w = Math.floor(window.innerWidth * dpr);
     const h = Math.floor(window.innerHeight * dpr);
-    world.renderer.setSize(window.innerWidth, window.innerHeight, false);
-    canvas.width = w;
-    canvas.height = h;
+    world.renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     world.setSize(w, h);
@@ -182,9 +234,12 @@ function showError(message: string): void {
   window.__vwError = message;
   const el = document.createElement('div');
   el.id = 'vw-error';
-  el.innerHTML = `<h2>WebGPU required</h2><p>${message}</p>
-    <p>volumetric-world needs WebGPU (Chrome/Edge 121+ on a desktop GPU).
-    On Linux, launch Chrome with <code>--enable-unsafe-webgpu --enable-features=Vulkan</code>.</p>`;
+  el.style.cssText = 'position:fixed;inset:0;display:grid;place-content:center;z-index:40;' +
+    'background:#f4ede2;color:#3a2c20;padding:32px;text-align:center;font-family:system-ui,sans-serif;';
+  el.innerHTML = `<h2>WebGPU initialization failed</h2><p>${message}</p>
+    <p>volumetric-world needs WebGPU (Chrome/Edge 121+ recommended; iOS Safari needs the WebGPU feature flag).
+    On Linux, launch Chrome with <code>--enable-unsafe-webgpu --enable-features=Vulkan</code>.</p>
+    <p>Add <code>?safe=1</code> to test plain three.js/WebGPU, or <code>?diag=1</code> for adapter details.</p>`;
   document.body.appendChild(el);
   document.getElementById('loading')?.remove();
 }

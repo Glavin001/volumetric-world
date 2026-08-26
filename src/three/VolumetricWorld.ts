@@ -62,6 +62,8 @@ export class VolumetricWorld {
   readonly renderer: THREE.WebGPURenderer;
   /** True when running on a software WebGPU adapter (SwiftShader/llvmpipe). */
   softwareAdapter = false;
+  /** Adapter description string for diagnostics overlays. */
+  gpuInfo = 'unknown adapter';
   readonly preset: QualityPreset;
   readonly engine: SolverEngine;
   readonly pass: VolumetricPass;
@@ -123,8 +125,17 @@ export class VolumetricWorld {
     // and one stuck mapAsync blocks every later buffer callback (FIFO delivery) —
     // so GPU timings are only tracked on real hardware.
     const probeAdapter = await (navigator as any).gpu.requestAdapter();
-    const arch = probeAdapter?.info?.architecture ?? '';
+    if (!probeAdapter) {
+      throw new Error('navigator.gpu.requestAdapter() returned null — WebGPU is present but no adapter is available.');
+    }
+    const info = probeAdapter?.info ?? {};
+    const arch = info.architecture ?? '';
     const softwareAdapter = /swiftshader|llvmpipe|software/i.test(arch);
+    const gpuInfo =
+      `${info.vendor ?? '?'} ${arch || '?'} ${info.description ?? ''} | ` +
+      `storageBufs=${probeAdapter.limits?.maxStorageBuffersPerShaderStage ?? '?'} ` +
+      `storageTex=${probeAdapter.limits?.maxStorageTexturesPerShaderStage ?? '?'} ` +
+      `sampled=${probeAdapter.limits?.maxSampledTexturesPerShaderStage ?? '?'}`;
     const renderer = new THREE.WebGPURenderer({
       canvas,
       antialias: false,
@@ -140,6 +151,7 @@ export class VolumetricWorld {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     const world = new VolumetricWorld(renderer, opts);
     world.softwareAdapter = softwareAdapter;
+    world.gpuInfo = gpuInfo;
     return world;
   }
 

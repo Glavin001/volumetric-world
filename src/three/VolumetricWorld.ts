@@ -96,6 +96,8 @@ export class VolumetricWorld {
   private promoteCooldownUntil = 0;
   private lastDivStats = { preMean: 0, postMean: 0, preMax: 0, postMax: 0 };
   private massPollAt = new Map<number, number>();
+  private lastDivPollAt = -1;
+  private divPollPending = false;
 
   private constructor(renderer: THREE.WebGPURenderer, opts: EngineOptions) {
     this.renderer = renderer;
@@ -151,6 +153,10 @@ export class VolumetricWorld {
 
   addStaticCollider(c: StaticCollider): void {
     this.statics.push(c);
+  }
+
+  removeStaticCollider(colliderId: number): void {
+    this.statics = this.statics.filter((c) => c.colliderId !== colliderId);
   }
 
   clearStaticColliders(): void {
@@ -443,6 +449,11 @@ export class VolumetricWorld {
   }
 
   private pollDivStats(): void {
+    // Rate-limit: readback callbacks resolve in FIFO order, so flooding the
+    // chain (e.g. one poll per step) starves export/retirement readbacks.
+    if (this.divPollPending || this.simTime - this.lastDivPollAt < 0.35) return;
+    this.divPollPending = true;
+    this.lastDivPollAt = this.simTime;
     this.enqueueReadback(async () => {
       const pre = await this.engine.readField(this.engine.scratch.coarseDivPre);
       const post = await this.engine.readField(this.engine.scratch.coarseDivPost);
@@ -461,6 +472,7 @@ export class VolumetricWorld {
         preMax: mPre,
         postMax: mPost,
       };
+      this.divPollPending = false;
     });
   }
 

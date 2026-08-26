@@ -74,13 +74,20 @@ export function setSunAngles(env: EnvCtx, elevationDeg: number, azimuthDeg: numb
   syncSun(env);
 }
 
+export interface Building {
+  mesh: THREE.Mesh;
+  colliderId: number;
+  center: Vec3;
+  size: Vec3;
+}
+
 /** Visible box mesh + matching static box collider. */
 export function addBuilding(
   env: EnvCtx,
   center: Vec3,
   size: Vec3,
   color = 0x9a8f85,
-): THREE.Mesh {
+): Building {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(size[0], size[1], size[2]),
     new THREE.MeshStandardMaterial({ color, roughness: 0.9 }),
@@ -95,12 +102,43 @@ export function addBuilding(
     kind: 'box',
     halfExtentsM: [size[0] / 2, size[1] / 2, size[2] / 2],
   });
+  const colliderId = nextColliderId++;
   env.world.addStaticCollider({
-    colliderId: nextColliderId++,
+    colliderId,
     shapeId,
     transform: { positionM: center, rotation: [0, 0, 0, 1] },
   });
-  return mesh;
+  return { mesh, colliderId, center, size };
+}
+
+/**
+ * Collapse a building: the tall collider is swapped for a rubble stub, the
+ * mesh crumbles to 22% height, and a staged crush emission fills the void —
+ * so injection has real air to emit into (solids reject dust by design).
+ */
+export function collapseBuilding(env: EnvCtx, b: Building, fineMassKg: number, seed = 1): void {
+  env.world.removeStaticCollider(b.colliderId);
+  const stubH = b.size[1] * 0.22;
+  b.mesh.scale.y = 0.22;
+  b.mesh.position.y = stubH / 2;
+  const shapeId = allocShapeId();
+  env.world.registerShape(shapeId, {
+    kind: 'box',
+    halfExtentsM: [b.size[0] / 2, stubH / 2, b.size[2] / 2],
+  });
+  env.world.addStaticCollider({
+    colliderId: nextColliderId++,
+    shapeId,
+    transform: { positionM: [b.center[0], stubH / 2, b.center[2]], rotation: [0, 0, 0, 1] },
+  });
+  emitCollapse(
+    env.world,
+    [b.center[0], stubH, b.center[2]],
+    [b.size[0] * 0.9, b.size[1] * 0.8, b.size[2] * 0.9],
+    fineMassKg,
+    'concrete',
+    seed,
+  );
 }
 
 /** Invisible static collider (sealed test rooms, hidden lids). */

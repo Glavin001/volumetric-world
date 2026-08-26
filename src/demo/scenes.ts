@@ -2,7 +2,7 @@ import * as THREE from 'three/webgpu';
 import type { Vec3 } from '../core/types';
 import type { VolumetricWorld } from '../three/VolumetricWorld';
 import {
-  EnvCtx, KinematicBody, addBuilding, addInvisibleCollider, emitCollapse, makeCar,
+  Building, EnvCtx, KinematicBody, addBuilding, addInvisibleCollider, collapseBuilding, makeCar,
   makeKinematicBody, allocShapeId, nextEvent, setSunAngles,
 } from './environment';
 
@@ -278,17 +278,16 @@ export const SCENES: SceneDef[] = [
         [-8, 0, 8],
         [10, 0, 9],
       ];
-      spots.forEach((p, i) => {
-        addBuilding(ctx.env, [p[0], 2.6, p[2] - 3.6], [4.5, 5.2, 3.4], 0x968878);
-        ctx.state[`spot${i}`] = p;
-      });
+      ctx.state.buildings = spots.map((p) =>
+        addBuilding(ctx.env, [p[0], 2.6, p[2] - 3.6], [4.5, 5.2, 3.4], 0x968878),
+      );
       ctx.state.emitted = 0;
     },
     tick(ctx, _dt, t) {
       const emitted = ctx.state.emitted as number;
+      const buildings = ctx.state.buildings as Building[];
       if (emitted < 4 && t > emitted * 0.55) {
-        const p = ctx.state[`spot${emitted}`] as Vec3;
-        emitCollapse(ctx.world, [p[0], 0, p[2]], [3.6, 4.5, 3.2], 210 + emitted * 30, 'concrete', emitted * 7 + 1);
+        collapseBuilding(ctx.env, buildings[emitted], 210 + emitted * 30, emitted * 7 + 1);
         ctx.state.emitted = emitted + 1;
       }
     },
@@ -301,26 +300,29 @@ export const SCENES: SceneDef[] = [
       lookAt(ctx, [26, 15, 30], [-2, 2, -4]);
       setSunAngles(ctx.env, 42, 118);
       ctx.world.setWind([2.6, 0, 0.7]);
+      const buildings: Building[] = [];
       for (let gx = -1; gx <= 1; gx++) {
         for (let gz = -1; gz <= 1; gz++) {
           if (gx === 0 && gz === 0) continue;
-          addBuilding(
+          buildings.push(addBuilding(
             ctx.env,
             [gx * 13, 3.0 + ((gx + gz + 4) % 3), gz * 12 - 4],
             [5.5, 6 + ((gx * 2 + gz + 6) % 4), 4.6],
             0x9a8d7d,
-          );
+          ));
         }
       }
+      ctx.state.buildings = buildings;
       ctx.state.emitted = 0;
     },
     tick(ctx, _dt, t) {
       const emitted = ctx.state.emitted as number;
+      const buildings = ctx.state.buildings as Building[];
       if (emitted === 0 && t > 0.2) {
-        emitCollapse(ctx.world, [-13, 0, -4], [4.5, 5.5, 3.8], 260, 'concrete', 21);
+        collapseBuilding(ctx.env, buildings[0], 260, 21); // (-13, ·, -16)
         ctx.state.emitted = 1;
       } else if (emitted === 1 && t > 1.4) {
-        emitCollapse(ctx.world, [0, 0, -16], [4.0, 5.0, 3.6], 230, 'drywall', 33);
+        collapseBuilding(ctx.env, buildings[1], 230, 33); // (-13, ·, -4)
         ctx.state.emitted = 2;
       }
     },

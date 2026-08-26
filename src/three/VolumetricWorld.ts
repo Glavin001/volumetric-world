@@ -16,7 +16,10 @@ import {
   packEffectors, packEvents, packPrims, packPromo, primFromBody, sourceBoundR, sourceCenter,
 } from '../webgpu/packing';
 import { MAX_PROMO, configureSweep } from '../webgpu/uniforms';
-import { VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE } from './volumetricPass';
+import {
+  VolumetricPass, MAX_ISLANDS, ISLE_STRIDE, PKT_STRIDE,
+  TILE_PX, MAX_TILES, MAX_PER_TILE, TILE_STRIDE, MAX_HEAVY,
+} from './volumetricPass';
 import { QID } from '../core/math';
 import type { AerosolMaterial, QualityPreset } from '../core/types';
 
@@ -727,7 +730,7 @@ export class VolumetricWorld {
   }
 
   render(scene: THREE.Scene, camera: THREE.PerspectiveCamera): void {
-    this.syncRenderUniforms();
+    this.syncRenderUniforms(camera);
     this.pass.render(scene, camera);
     this.resolveGpuTimings();
   }
@@ -759,7 +762,7 @@ export class VolumetricWorld {
     }
   }
 
-  private syncRenderUniforms(): void {
+  private syncRenderUniforms(camera: THREE.PerspectiveCamera): void {
     const pass = this.pass;
     const sunD = norm(this.sun.dir);
     (pass.sunDir.value as THREE.Vector3).set(sunD[0], sunD[1], sunD[2]);
@@ -798,6 +801,7 @@ export class VolumetricWorld {
     const parr = (pass.packets as any).array as THREE.Vector4[];
     const maxP = Math.floor(parr.length / PKT_STRIDE);
     let pc = 0;
+    const packed: VolumePacket[] = [];
     for (const p of sorted) {
       if (pc >= maxP) break;
       if (p.fade <= 0.01) continue;
@@ -812,9 +816,79 @@ export class VolumetricWorld {
       );
       parr[b + 3].set(p.albedoRgb[0], p.albedoRgb[1], p.albedoRgb[2], Math.min(p.ageSeconds, 20));
       parr[b + 4].set(p.velocity[0], p.velocity[1], p.velocity[2], p.seed % 17);
+      packed.push(p);
       pc++;
     }
     (pass.packetCount as any).value = pc;
+    this.binPacketsToTiles(packed, camera);
+  }
+
+  private static binScratch = { v: new THREE.Vector3() };
+
+  /**
+   * CPU screen-tile binning: each rendered packet's bounding sphere is
+   * projected to a half-res pixel rect and its index appended to every tile it
+   * touches (nearest-first, capped). The raymarch then evaluates only its
+   * tile's packets instead of the whole render list — the loop that used to be
+   * pixels × steps × ALL packets. A short global list of the optically
+   * heaviest packets serves the sun-shadow paths, which don't follow tiles.
+   */
+  private binPacketsToTiles(packed: VolumePacket[], camera: THREE.PerspectiveCamera): void {
+    const pass = this.pass;
+    const tiles = pass.tileData;
+    const tilesX = (pass.tilesX as any).value as number;
+    const tilesY = (pass.tilesY as any).value as number;
+    const tileCount = Math.min(tilesX * tilesY, MAX_TILES);
+    for (let t = 0; t < tileCount; t++) tiles[t * TILE_STRIDE] = 0;
+
+    const hw = (pass.halfSize.value as THREE.Vector2).x;
+    const hh = (pass.halfSize.value as THREE.Vector2).y;
+    const v = VolumetricWorld.binScratch.v;
+    const tanHalfFov = Math.tan((camera.fov * Math.PI) / 360);
+
+    const addToTile = (t: number, idx: number): void => {
+      const base = t * TILE_STRIDE;
+      const n = tiles[base];
+      if (n >= MAX_PER_TILE) return; // keep-nearest: list is distance-sorted
+      tiles[base + 1 + n] = idx;
+      tiles[base] = n + 1;
+    };
+
+    for (let idx = 0; idx < packed.length; idx++) {
+      const p = packed[idx];
+      const rad = Math.max(p.radii[0], p.radii[1], p.radii[2]) * 2.6;
+      v.set(p.position[0], p.position[1], p.position[2]);
+      const dist = v.distanceTo(camera.position);
+      if (dist <= rad) {
+        // Camera inside the bound: conservative splat to every tile.
+        for (let t = 0; t < tileCount; t++) addToTile(t, idx);
+        continue;
+      }
+      v.project(camera);
+      if (v.z > 1) continue; // fully behind
+      // NDC footprint of the bounding sphere.
+      const ry = rad / (dist * tanHalfFov);
+      const rx = ry / Math.max(camera.aspect, 1e-3);
+      const x0 = Math.max(0, Math.floor((((v.x - rx) * 0.5 + 0.5) * hw) / TILE_PX));
+      const x1 = Math.min(tilesX - 1, Math.floor((((v.x + rx) * 0.5 + 0.5) * hw) / TILE_PX));
+      const y0 = Math.max(0, Math.floor((((-v.y - ry) * 0.5 + 0.5) * hh) / TILE_PX));
+      const y1 = Math.min(tilesY - 1, Math.floor((((-v.y + ry) * 0.5 + 0.5) * hh) / TILE_PX));
+      for (let ty = y0; ty <= y1; ty++) {
+        for (let tx = x0; tx <= x1; tx++) {
+          addToTile(ty * tilesX + tx, idx);
+        }
+      }
+    }
+    pass.tileAttr.needsUpdate = true;
+
+    // Heaviest casters for the sun-shadow paths.
+    const byWeight = packed
+      .map((p, i) => ({ i, w: PacketSystem.peakSigmaT(p) * Math.max(...p.radii) }))
+      .sort((a, b) => b.w - a.w)
+      .slice(0, MAX_HEAVY);
+    const heavy = (pass.heavyIdx as any).array as number[] | Float32Array;
+    for (let j = 0; j < byWeight.length; j++) heavy[j] = byWeight[j].i;
+    (pass.heavyCount as any).value = byWeight.length;
   }
 
   private gpuTimingsPending = false;
